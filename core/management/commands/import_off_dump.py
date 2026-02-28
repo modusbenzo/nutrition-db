@@ -158,25 +158,37 @@ class Command(BaseCommand):
         )
 
     def _download_dump(self, file_path: Path):
-        """Download OFF dump with progress, resumable."""
+        """Download OFF dump with progress."""
         DUMP_DIR.mkdir(parents=True, exist_ok=True)
+        headers = {"User-Agent": "NutritionCoreDB/1.0 (bulk import)"}
 
-        # Check if already downloaded
-        if file_path.exists():
+        # Check if already downloaded (must be > 1 MB to be valid)
+        if file_path.exists() and file_path.stat().st_size > 1_000_000:
             local_size = file_path.stat().st_size
-            # Check remote size
-            resp = requests.head(OFF_DUMP_URL, timeout=10)
-            remote_size = int(resp.headers.get("content-length", 0))
-            if local_size == remote_size and remote_size > 0:
-                self.stdout.write(f"Dump already downloaded ({local_size / 1e9:.1f} GB)")
+            try:
+                resp = requests.head(OFF_DUMP_URL, headers=headers, timeout=15, allow_redirects=True)
+                remote_size = int(resp.headers.get("content-length", 0))
+                if local_size == remote_size and remote_size > 0:
+                    self.stdout.write(f"Dump already downloaded ({local_size / 1e9:.1f} GB)")
+                    return
+            except Exception:
+                self.stdout.write(f"Using existing file ({local_size / 1e9:.1f} GB)")
                 return
+        elif file_path.exists():
+            # Remove broken/empty file
+            file_path.unlink()
 
         self.stdout.write(f"Downloading OFF dump to {file_path} ...")
+        self.stdout.write(f"URL: {OFF_DUMP_URL}")
         self.stdout.write("This is ~7 GB and may take a while.")
 
-        resp = requests.get(OFF_DUMP_URL, stream=True, timeout=30)
+        resp = requests.get(
+            OFF_DUMP_URL, stream=True, headers=headers, timeout=60, allow_redirects=True
+        )
         resp.raise_for_status()
         total = int(resp.headers.get("content-length", 0))
+
+        self.stdout.write(f"Response status: {resp.status_code}, Content-Length: {total}")
 
         downloaded = 0
         with open(file_path, "wb") as f:
@@ -190,7 +202,21 @@ class Command(BaseCommand):
                         f"({pct:.0f}%)",
                         ending="",
                     )
+                else:
+                    self.stdout.write(
+                        f"\r  {downloaded / 1e6:.0f} MB downloaded ...",
+                        ending="",
+                    )
+
         self.stdout.write(f"\nDownload complete: {downloaded / 1e9:.1f} GB")
+
+        if downloaded < 1_000_000:
+            file_path.unlink()
+            raise CommandError(
+                f"Download too small ({downloaded} bytes). "
+                "OFF may be blocking the request. Try downloading manually:\n"
+                f"  wget -O {file_path} '{OFF_DUMP_URL}'"
+            )
 
     def _stream_lines(self, file_path: Path):
         """Stream JSONL.gz line by line, low memory."""
