@@ -1,0 +1,12 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.env
+db.sqlite3
+staticfiles/
+pgdata/
+*.log

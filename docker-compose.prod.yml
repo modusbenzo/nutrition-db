@@ -1,0 +1,54 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: always
+    env_file: .env
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  web:
+    build: .
+    restart: always
+    env_file: .env
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+
+  # Backup: manuell oder per Cronjob
+  backup:
+    image: postgres:16-alpine
+    restart: "no"
+    env_file: .env
+    volumes:
+      - /home/deploy/backups:/backups
+    entrypoint: >
+      sh -c "PGPASSWORD=$$POSTGRES_PASSWORD pg_dump
+        -h db -U $$POSTGRES_USER $$POSTGRES_DB
+        | gzip > /backups/nutrition_$$(date +%Y%m%d_%H%M%S).sql.gz
+        && echo 'Backup done.'
+        && find /backups -name '*.sql.gz' -mtime +30 -delete"
+    depends_on:
+      db:
+        condition: service_healthy
+    profiles:
+      - backup
+
+volumes:
+  pgdata:
