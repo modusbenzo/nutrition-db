@@ -119,9 +119,9 @@ class Command(BaseCommand):
         total_rows = pf.metadata.num_rows
         self.stdout.write(f"Parquet: {file_size / 1e9:.2f} GB, {total_rows:,} rows")
 
-        # Read columns we need
+        # Read columns we need — use schema_arrow for top-level names (handles nested types)
         read_cols = ["code", "product_name", "brands", "ingredients_text", "lang", "nutriments"]
-        available = set(pf.schema.names)
+        available = set(pf.schema_arrow.names)
         read_cols = [c for c in read_cols if c in available]
         self.stdout.write(f"Reading columns: {read_cols}")
 
