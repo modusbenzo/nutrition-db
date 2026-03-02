@@ -20,7 +20,7 @@ from pathlib import Path
 
 import requests
 from django.core.management.base import BaseCommand, CommandError
-from django.db import transaction
+from django.db import connection, transaction
 
 from core.models import (
     FoodItem,
@@ -146,22 +146,51 @@ class Command(BaseCommand):
                     f"    Loaded nutrients for {len(nutrients_data):,} foods."
                 )
 
+                # Disable search_vector trigger during bulk import (massive speedup)
+                with connection.cursor() as cur:
+                    cur.execute(
+                        "ALTER TABLE core_foodtext DISABLE TRIGGER "
+                        "foodtext_search_vector_update"
+                    )
+
                 # Import this chunk in DB batches
+                chunk_imported = 0
                 for i in range(0, len(chunk_ids), batch_size):
-                    batch_ids = chunk_ids[i : i + batch_size]
+                    batch_fdc_ids = chunk_ids[i : i + batch_size]
                     result = self._import_batch(
-                        batch_ids, foods, brands, nutrients_data
+                        batch_fdc_ids, foods, brands, nutrients_data
                     )
                     stats["imported"] += result["imported"]
                     stats["skipped"] += result["skipped"]
                     stats["accepted"] += result["accepted"]
                     stats["rejected"] += result["rejected"]
                     stats["dedup_linked"] += result["dedup_linked"]
+                    chunk_imported += result["imported"] + result["skipped"] + result["dedup_linked"]
+
+                    # Progress every 10 batches
+                    if (i // batch_size) % 10 == 9:
+                        elapsed = time.time() - t0
+                        total_done = start + chunk_imported
+                        rate = total_done / elapsed if elapsed > 0 else 0
+                        self.stdout.write(
+                            f"    {total_done:>10,} / {total_foods:,} "
+                            f"| imp: {stats['imported']:,} "
+                            f"| skip: {stats['skipped']:,} "
+                            f"| dedup: {stats['dedup_linked']:,} "
+                            f"| {rate:,.0f}/s"
+                        )
+
+                # Re-enable trigger
+                with connection.cursor() as cur:
+                    cur.execute(
+                        "ALTER TABLE core_foodtext ENABLE TRIGGER "
+                        "foodtext_search_vector_update"
+                    )
 
                 done = end
                 elapsed = time.time() - t0
                 self.stdout.write(
-                    f"    Progress: {done:,} / {total_foods:,} "
+                    f"    Chunk done: {done:,} / {total_foods:,} "
                     f"| imported: {stats['imported']:,} "
                     f"| dedup: {stats['dedup_linked']:,} "
                     f"| {elapsed:.0f}s"
