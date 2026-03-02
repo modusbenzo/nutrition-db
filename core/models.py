@@ -1,5 +1,7 @@
 import uuid
 
+from django.contrib.postgres.indexes import GinIndex
+from django.contrib.postgres.search import SearchVectorField
 from django.db import models
 
 
@@ -18,12 +20,20 @@ class NutrientBasis(models.TextChoices):
 class ImportSource(models.TextChoices):
     USDA = "USDA", "USDA"
     OFF = "OFF", "Open Food Facts"
+    USER_REQUEST = "USER_REQ", "User Request"
 
 
 class ValidationStatus(models.TextChoices):
     ACCEPTED = "accepted", "Accepted"
     REJECTED = "rejected", "Rejected"
     NEEDS_REVIEW = "needs_review", "Needs Review"
+
+
+class FoodRequestStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    AUTO_CREATED = "auto_created", "Auto-Created"
+    APPROVED = "approved", "Approved"
+    REJECTED = "rejected", "Rejected"
 
 
 # ---------------------------------------------------------------------------
@@ -55,10 +65,24 @@ class FoodText(models.Model):
     name = models.CharField(max_length=500)
     brand = models.CharField(max_length=255, blank=True, null=True)
     ingredients = models.TextField(blank=True, null=True)
+    search_vector = SearchVectorField(null=True, blank=True)
 
     class Meta:
         unique_together = [("food_item", "lang")]
         ordering = ["lang"]
+        indexes = [
+            GinIndex(fields=["search_vector"], name="foodtext_search_gin"),
+            GinIndex(
+                name="foodtext_name_trgm",
+                fields=["name"],
+                opclasses=["gin_trgm_ops"],
+            ),
+            GinIndex(
+                name="foodtext_brand_trgm",
+                fields=["brand"],
+                opclasses=["gin_trgm_ops"],
+            ),
+        ]
 
     def __str__(self):
         return f"{self.name} ({self.lang})"
@@ -125,6 +149,9 @@ class ImportedRecord(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["source", "external_id"], name="importrec_source_extid"),
+        ]
 
     def __str__(self):
         return f"{self.source}:{self.external_id}"
@@ -150,3 +177,59 @@ class ValidationEvent(models.Model):
 
     def __str__(self):
         return f"{self.imported_record} -> {self.status}"
+
+
+# ---------------------------------------------------------------------------
+# FoodRequest — Learning loop for missing foods
+# ---------------------------------------------------------------------------
+class FoodRequest(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    # What the user searched for
+    original_query = models.CharField(max_length=500)
+    lang = models.CharField(max_length=10, default="de")
+
+    # Data submitted by the app (from web search, barcode scan, etc.)
+    submitted_name = models.CharField(max_length=500, blank=True, default="")
+    submitted_brand = models.CharField(max_length=255, blank=True, default="")
+    submitted_barcode = models.CharField(max_length=50, blank=True, default="")
+    submitted_nutrients = models.JSONField(
+        default=dict, blank=True,
+        help_text="Dict of canonical_code -> amount per 100g",
+    )
+    submitted_source_url = models.URLField(max_length=1000, blank=True, default="")
+    submitted_raw_data = models.JSONField(default=dict, blank=True)
+
+    # Processing
+    status = models.CharField(
+        max_length=20,
+        choices=FoodRequestStatus.choices,
+        default=FoodRequestStatus.PENDING,
+        db_index=True,
+    )
+    food_item = models.ForeignKey(
+        FoodItem,
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+        related_name="food_requests",
+    )
+
+    # AI review
+    ai_confidence = models.FloatField(default=0.0)
+    ai_review_notes = models.TextField(blank=True, default="")
+
+    # Metadata
+    request_count = models.PositiveIntegerField(default=1)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-request_count", "-created_at"]
+        indexes = [
+            models.Index(fields=["status", "-request_count"], name="foodreq_status_count"),
+            models.Index(fields=["submitted_barcode"], name="foodreq_barcode"),
+        ]
+
+    def __str__(self):
+        return f"FoodRequest: {self.original_query} ({self.status})"

@@ -2,7 +2,8 @@
 Bulk import from USDA FoodData Central CSV dump.
 
 Downloads the FoodData Central CSV bundle and imports Foundation Foods,
-SR Legacy, and Branded Foods.
+SR Legacy, and Branded Foods — with barcode-based deduplication against
+existing OFF products.
 
 Usage:
     # Full import
@@ -40,8 +41,8 @@ from core.models import (
     ValidationEvent,
 )
 
-# USDA releases updates regularly; this is the latest stable URL pattern.
-USDA_DUMP_URL = "https://fdc.nal.usda.gov/fdc-datasets/FoodData_Central_csv_2024-10-31.zip"
+# Updated to latest USDA release (S3 direct link)
+USDA_DUMP_URL = "https://fdc-datasets.s3.amazonaws.com/FoodData_Central_csv_2025-12-18.zip"
 DUMP_DIR = Path("/tmp/nutrition-imports")
 DUMP_FILE = DUMP_DIR / "FoodData_Central_csv.zip"
 
@@ -60,7 +61,7 @@ DATA_TYPE_MAP = {
 
 
 class Command(BaseCommand):
-    help = "Bulk import from USDA FoodData Central CSV dump"
+    help = "Bulk import from USDA FoodData Central CSV dump (with barcode dedup)"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -109,11 +110,11 @@ class Command(BaseCommand):
             csv_files = [n for n in zf.namelist() if n.endswith(".csv")]
             self.stdout.write(f"  Found {len(csv_files)} CSV files in archive.")
 
-            # 1) Load food.csv → build food index
+            # 1) Load food.csv -> build food index
             foods = self._read_foods(zf, limit)
             self.stdout.write(f"  Loaded {len(foods)} foods to import.")
 
-            # 2) Load branded_food.csv for brand info
+            # 2) Load branded_food.csv for brand info + barcodes
             brands = self._read_brands(zf, set(foods.keys()))
             self.stdout.write(f"  Loaded {len(brands)} brand entries.")
 
@@ -125,7 +126,13 @@ class Command(BaseCommand):
 
         # 4) Import in batches
         self.stdout.write("Importing into database ...")
-        stats = {"imported": 0, "skipped": 0, "accepted": 0, "rejected": 0}
+        stats = {
+            "imported": 0,
+            "skipped": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "dedup_linked": 0,
+        }
         t0 = time.time()
 
         food_ids = list(foods.keys())
@@ -136,12 +143,14 @@ class Command(BaseCommand):
             stats["skipped"] += result["skipped"]
             stats["accepted"] += result["accepted"]
             stats["rejected"] += result["rejected"]
+            stats["dedup_linked"] += result["dedup_linked"]
 
             if (i + batch_size) % 5000 == 0 or i + batch_size >= len(food_ids):
                 elapsed = time.time() - t0
                 self.stdout.write(
                     f"  {min(i + batch_size, len(food_ids)):>8,} / {len(food_ids):,} "
                     f"| imported: {stats['imported']:,} "
+                    f"| dedup: {stats['dedup_linked']:,} "
                     f"| {elapsed:.0f}s"
                 )
 
@@ -149,10 +158,11 @@ class Command(BaseCommand):
         self.stdout.write(
             self.style.SUCCESS(
                 f"\nDone in {elapsed:.0f}s:\n"
-                f"  Imported:  {stats['imported']:,}\n"
-                f"  Skipped:   {stats['skipped']:,}\n"
-                f"  Accepted:  {stats['accepted']:,}\n"
-                f"  Rejected:  {stats['rejected']:,}"
+                f"  Imported:     {stats['imported']:,}\n"
+                f"  Skipped:      {stats['skipped']:,}\n"
+                f"  Dedup linked: {stats['dedup_linked']:,}\n"
+                f"  Accepted:     {stats['accepted']:,}\n"
+                f"  Rejected:     {stats['rejected']:,}"
             )
         )
 
@@ -188,7 +198,7 @@ class Command(BaseCommand):
             self._nutrient_cache[n.usda_nutrient_id] = n
 
     def _read_csv_from_zip(self, zf, filename):
-        """Read a CSV from the ZIP, return a csv.DictReader."""
+        """Read a CSV from the ZIP, return a list of dicts."""
         # Find the file (might be in a subdirectory)
         matching = [n for n in zf.namelist() if n.endswith(f"/{filename}") or n == filename]
         if not matching:
@@ -199,7 +209,7 @@ class Command(BaseCommand):
             return list(reader)
 
     def _read_foods(self, zf, limit):
-        """Read food.csv → {fdc_id: {description, data_type, ...}}."""
+        """Read food.csv -> {fdc_id: {description, data_type, ...}}."""
         rows = self._read_csv_from_zip(zf, "food.csv")
         if not rows:
             raise CommandError("food.csv not found in ZIP")
@@ -226,7 +236,7 @@ class Command(BaseCommand):
         return foods
 
     def _read_brands(self, zf, fdc_ids):
-        """Read branded_food.csv → {fdc_id: {brand_owner, ingredients}}."""
+        """Read branded_food.csv -> {fdc_id: {brand_owner, ingredients, gtin_upc}}."""
         rows = self._read_csv_from_zip(zf, "branded_food.csv")
         if not rows:
             return {}
@@ -245,7 +255,7 @@ class Command(BaseCommand):
         return brands
 
     def _read_food_nutrients(self, zf, fdc_ids):
-        """Read food_nutrient.csv → {fdc_id: [(nutrient_id, amount), ...]}."""
+        """Read food_nutrient.csv -> {fdc_id: [(nutrient_id, amount), ...]}."""
         rows = self._read_csv_from_zip(zf, "food_nutrient.csv")
         if not rows:
             raise CommandError("food_nutrient.csv not found in ZIP")
@@ -279,16 +289,39 @@ class Command(BaseCommand):
 
     @transaction.atomic
     def _import_batch(self, batch_ids, foods, brands, nutrients_data):
-        """Import a batch of USDA foods."""
-        result = {"imported": 0, "skipped": 0, "accepted": 0, "rejected": 0}
+        """Import a batch of USDA foods with barcode-based deduplication."""
+        result = {
+            "imported": 0,
+            "skipped": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "dedup_linked": 0,
+        }
 
-        # Check existing
+        # Check existing USDA imports
         canonical_keys = [f"usda:{fdc_id}" for fdc_id in batch_ids]
         existing = set(
             FoodItem.objects.filter(
                 canonical_key__in=canonical_keys
             ).values_list("canonical_key", flat=True)
         )
+
+        # Collect barcodes for dedup check against OFF data
+        barcodes_to_check = {}
+        for fdc_id in batch_ids:
+            brand_data = brands.get(fdc_id, {})
+            gtin = brand_data.get("gtin_upc")
+            if gtin and len(gtin) >= 4:
+                barcodes_to_check[fdc_id] = gtin
+
+        # Batch-lookup existing OFF products by barcode
+        off_by_barcode = {}
+        if barcodes_to_check:
+            off_keys = [f"off:{bc}" for bc in barcodes_to_check.values()]
+            for food in FoodItem.objects.filter(canonical_key__in=off_keys):
+                # Extract barcode from canonical_key "off:BARCODE"
+                bc = food.canonical_key[4:]
+                off_by_barcode[bc] = food
 
         for fdc_id in batch_ids:
             canonical_key = f"usda:{fdc_id}"
@@ -299,6 +332,28 @@ class Command(BaseCommand):
             food_data = foods[fdc_id]
             brand_data = brands.get(fdc_id, {})
             nutrient_list = nutrients_data.get(fdc_id, [])
+
+            # Barcode-based deduplication: if USDA branded food has a barcode
+            # that already exists as an OFF product, link instead of creating new
+            gtin = brand_data.get("gtin_upc")
+            if gtin and gtin in off_by_barcode:
+                existing_food = off_by_barcode[gtin]
+                # Link USDA data as ImportedRecord to existing OFF FoodItem
+                ImportedRecord.objects.create(
+                    source="USDA",
+                    external_id=str(fdc_id),
+                    raw_json={
+                        "fdc_id": fdc_id,
+                        "description": food_data["description"],
+                        "data_type": food_data["data_type"],
+                        "brand": brand_data,
+                        "nutrient_count": len(nutrient_list),
+                        "dedup_note": f"Linked to existing OFF product off:{gtin}",
+                    },
+                    food_item=existing_food,
+                )
+                result["dedup_linked"] += 1
+                continue
 
             try:
                 accepted = self._import_food(

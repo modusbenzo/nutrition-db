@@ -30,6 +30,7 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    "django.contrib.postgres",
     "rest_framework",
     "core",
     "api",
@@ -93,14 +94,36 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
+# ---------------------------------------------------------------------------
+# REST Framework
+# ---------------------------------------------------------------------------
 REST_FRAMEWORK = {
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 25,
 }
 
 # ---------------------------------------------------------------------------
+# Caches — in-memory cache for search results (5 min TTL)
+# ---------------------------------------------------------------------------
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "nutrition-search-cache",
+        "TIMEOUT": 300,  # 5 minutes
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Unfold Admin Theme
 # ---------------------------------------------------------------------------
+
+def pending_request_count(request):
+    """Badge callback for sidebar — shows number of pending food requests."""
+    from core.models import FoodRequest
+    count = FoodRequest.objects.filter(status="pending").count()
+    return count if count > 0 else None
+
+
 UNFOLD = {
     "SITE_TITLE": "Nutrition DB",
     "SITE_HEADER": "Nutrition Core Database",
@@ -153,6 +176,12 @@ UNFOLD = {
                         "icon": "flag",
                         "link": reverse_lazy("admin:core_validationevent_changelist"),
                         "badge": "core.admin.rejected_count",
+                    },
+                    {
+                        "title": "Food Requests",
+                        "icon": "add_circle",
+                        "link": reverse_lazy("admin:core_foodrequest_changelist"),
+                        "badge": "config.settings.pending_request_count",
                     },
                 ],
             },

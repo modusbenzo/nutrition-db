@@ -1,4 +1,5 @@
 import json
+from decimal import Decimal, InvalidOperation
 
 from django.contrib import admin
 from django.db.models import Count
@@ -9,6 +10,7 @@ from unfold.decorators import action, display
 from .models import (
     FoodItem,
     FoodNutrientValue,
+    FoodRequest,
     FoodText,
     ImportedRecord,
     Nutrient,
@@ -17,7 +19,7 @@ from .models import (
 
 
 def rejected_count(request):
-    """Badge callback for sidebar — shows number of items needing review."""
+    """Badge callback for sidebar -- shows number of items needing review."""
     count = ValidationEvent.objects.filter(
         status__in=["rejected", "needs_review"]
     ).count()
@@ -187,7 +189,7 @@ class ImportedRecordAdmin(ModelAdmin):
 
     @display(
         description="Quelle",
-        label={"USDA": "info", "OFF": "success"},
+        label={"USDA": "info", "OFF": "success", "USER_REQ": "warning"},
     )
     def source_badge(self, obj):
         return obj.source
@@ -217,7 +219,7 @@ class ImportedRecordAdmin(ModelAdmin):
 
 
 # ---------------------------------------------------------------------------
-# ValidationEvent — "Rejected Queue"
+# ValidationEvent -- "Rejected Queue"
 # ---------------------------------------------------------------------------
 @admin.register(ValidationEvent)
 class ValidationEventAdmin(ModelAdmin):
@@ -343,3 +345,250 @@ class ValidationEventAdmin(ModelAdmin):
                 record.save(update_fields=["food_item"])
                 linked += 1
         self.message_user(request, f"{linked} Datensatz/Datensaetze verlinkt.")
+
+
+# ---------------------------------------------------------------------------
+# FoodRequest -- "Learning Loop"
+# ---------------------------------------------------------------------------
+@admin.register(FoodRequest)
+class FoodRequestAdmin(ModelAdmin):
+    list_display = (
+        "original_query",
+        "show_submitted_name",
+        "show_barcode",
+        "status_badge",
+        "request_count_display",
+        "ai_confidence_bar",
+        "show_linked",
+        "created_at",
+    )
+    list_filter = ("status", "lang")
+    search_fields = ("original_query", "submitted_name", "submitted_barcode")
+    readonly_fields = (
+        "id",
+        "created_at",
+        "updated_at",
+        "request_count",
+        "ai_confidence",
+        "ai_review_notes",
+        "nutrients_display",
+        "raw_data_display",
+    )
+    list_per_page = 30
+    autocomplete_fields = ("food_item",)
+    actions = ["approve_and_create", "reject_requests"]
+
+    fieldsets = (
+        (
+            "Anfrage",
+            {
+                "fields": (
+                    "original_query",
+                    "lang",
+                    "submitted_name",
+                    "submitted_brand",
+                    "submitted_barcode",
+                    "submitted_source_url",
+                ),
+            },
+        ),
+        (
+            "Nahrwerte",
+            {
+                "fields": ("nutrients_display",),
+                "classes": ("collapse",),
+            },
+        ),
+        (
+            "Rohdaten",
+            {
+                "fields": ("raw_data_display",),
+                "classes": ("collapse",),
+            },
+        ),
+        (
+            "Verarbeitung",
+            {
+                "fields": (
+                    "status",
+                    "food_item",
+                    "ai_confidence",
+                    "ai_review_notes",
+                    "request_count",
+                ),
+            },
+        ),
+        ("Meta", {"fields": ("id", "created_at", "updated_at")}),
+    )
+
+    @display(description="Name")
+    def show_submitted_name(self, obj):
+        return obj.submitted_name or "-"
+
+    @display(description="Barcode")
+    def show_barcode(self, obj):
+        return obj.submitted_barcode or "-"
+
+    @display(
+        description="Status",
+        label={
+            "pending": "warning",
+            "auto_created": "info",
+            "approved": "success",
+            "rejected": "danger",
+        },
+    )
+    def status_badge(self, obj):
+        return obj.status
+
+    @display(description="Anfragen")
+    def request_count_display(self, obj):
+        count = obj.request_count
+        if count >= 10:
+            return format_html(
+                '<span style="color:#ef4444;font-weight:bold">{}</span>', count
+            )
+        elif count >= 5:
+            return format_html(
+                '<span style="color:#f59e0b;font-weight:bold">{}</span>', count
+            )
+        return count
+
+    @display(description="Konfidenz")
+    def ai_confidence_bar(self, obj):
+        pct = int(obj.ai_confidence * 100)
+        color = "#22c55e" if pct >= 80 else "#f59e0b" if pct >= 50 else "#ef4444"
+        return format_html(
+            '<div style="width:80px;background:#e5e7eb;border-radius:4px;overflow:hidden">'
+            '<div style="width:{}%;height:8px;background:{};border-radius:4px"></div>'
+            "</div>"
+            '<span style="font-size:11px;color:#6b7280">{}%</span>',
+            pct,
+            color,
+            pct,
+        )
+
+    @display(description="Verlinkt")
+    def show_linked(self, obj):
+        if obj.food_item:
+            return format_html(
+                '<span style="color:green">&#10003;</span> {}',
+                obj.food_item.canonical_key[:40],
+            )
+        return format_html('<span style="color:#9ca3af">-</span>')
+
+    def nutrients_display(self, obj):
+        if not obj.submitted_nutrients:
+            return "-"
+        pretty = json.dumps(obj.submitted_nutrients, indent=2, ensure_ascii=False)
+        return format_html(
+            '<pre style="max-height:300px;overflow:auto;background:#f8f9fa;'
+            'padding:12px;border-radius:8px;font-size:12px">{}</pre>',
+            pretty,
+        )
+
+    nutrients_display.short_description = "Eingereichte Nahrwerte"
+
+    def raw_data_display(self, obj):
+        if not obj.submitted_raw_data:
+            return "-"
+        pretty = json.dumps(obj.submitted_raw_data, indent=2, ensure_ascii=False)
+        return format_html(
+            '<pre style="max-height:300px;overflow:auto;background:#f8f9fa;'
+            'padding:12px;border-radius:8px;font-size:12px">{}</pre>',
+            pretty,
+        )
+
+    raw_data_display.short_description = "Rohdaten"
+
+    # -- Admin Actions --
+    @action(description="Genehmigen & FoodItem erstellen")
+    def approve_and_create(self, request, queryset):
+        created = 0
+        for req in queryset.filter(status__in=["pending", "auto_created"]):
+            food_item = self._create_food_from_request(req)
+            if food_item:
+                req.status = "approved"
+                req.food_item = food_item
+                req.ai_review_notes = f"Approved by admin: {request.user.username}"
+                req.save(update_fields=["status", "food_item", "ai_review_notes", "updated_at"])
+                created += 1
+        self.message_user(
+            request,
+            f"{created} Lebensmittel erstellt und genehmigt.",
+        )
+
+    @action(description="Ablehnen")
+    def reject_requests(self, request, queryset):
+        updated = queryset.filter(status="pending").update(
+            status="rejected",
+            ai_review_notes=f"Rejected by admin: {request.user.username}",
+        )
+        self.message_user(request, f"{updated} Anfrage(n) abgelehnt.")
+
+    def _create_food_from_request(self, req):
+        """Create a FoodItem from an approved FoodRequest."""
+        name = req.submitted_name or req.original_query
+        barcode = req.submitted_barcode
+        canonical_key = f"req:{barcode}" if barcode else f"req:{req.id}"
+
+        if FoodItem.objects.filter(canonical_key=canonical_key).exists():
+            return FoodItem.objects.get(canonical_key=canonical_key)
+
+        try:
+            food = FoodItem.objects.create(
+                canonical_key=canonical_key,
+                food_type="branded" if barcode else "raw",
+            )
+            FoodText.objects.create(
+                food_item=food,
+                lang=req.lang,
+                name=name,
+                brand=req.submitted_brand or None,
+            )
+
+            ImportedRecord.objects.create(
+                source="USER_REQ",
+                external_id=str(req.id),
+                raw_json={
+                    "original_query": req.original_query,
+                    "submitted_name": req.submitted_name,
+                    "submitted_brand": req.submitted_brand,
+                    "submitted_barcode": barcode,
+                },
+                food_item=food,
+            )
+
+            # Nutrients
+            nutrients = req.submitted_nutrients or {}
+            if nutrients:
+                nutrient_objs = {
+                    n.canonical_code: n
+                    for n in Nutrient.objects.filter(
+                        canonical_code__in=list(nutrients.keys())
+                    )
+                }
+                values_to_create = []
+                for code, amount in nutrients.items():
+                    nutrient = nutrient_objs.get(code)
+                    if not nutrient:
+                        continue
+                    try:
+                        values_to_create.append(
+                            FoodNutrientValue(
+                                food_item=food,
+                                nutrient=nutrient,
+                                basis="per_100g",
+                                amount=Decimal(str(amount)),
+                                unit=nutrient.unit,
+                            )
+                        )
+                    except (InvalidOperation, ValueError):
+                        continue
+
+                if values_to_create:
+                    FoodNutrientValue.objects.bulk_create(values_to_create)
+
+            return food
+        except Exception:
+            return None
