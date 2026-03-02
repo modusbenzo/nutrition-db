@@ -5,24 +5,18 @@ Downloads the FoodData Central CSV bundle and imports Foundation Foods,
 SR Legacy, and Branded Foods — with barcode-based deduplication against
 existing OFF products.
 
+Streams CSV files instead of loading into memory to avoid OOM on
+servers with limited RAM.
+
 Usage:
-    # Full import
     python manage.py import_usda_dump
-
-    # Limit to N foods (for testing)
     python manage.py import_usda_dump --limit 10000
-
-    # Skip download
     python manage.py import_usda_dump --skip-download
-
-    # Use specific ZIP file
     python manage.py import_usda_dump --file /path/to/FoodData_Central_csv.zip
 """
 
 import csv
 import io
-import json
-import os
 import time
 import zipfile
 from decimal import Decimal, InvalidOperation
@@ -41,17 +35,14 @@ from core.models import (
     ValidationEvent,
 )
 
-# Updated to latest USDA release (S3 direct link)
 USDA_DUMP_URL = "https://fdc.nal.usda.gov/fdc-datasets/FoodData_Central_csv_2025-12-18.zip"
 DUMP_DIR = Path("/tmp/nutrition-imports")
 DUMP_FILE = DUMP_DIR / "FoodData_Central_csv.zip"
 
 BATCH_SIZE = 500
 
-# USDA data_type values we care about
 RELEVANT_DATA_TYPES = {"foundation_food", "sr_legacy_food", "branded_food", "survey_fndds_food"}
 
-# Map USDA data_type to our food_type
 DATA_TYPE_MAP = {
     "foundation_food": "raw",
     "sr_legacy_food": "raw",
@@ -61,11 +52,11 @@ DATA_TYPE_MAP = {
 
 
 class Command(BaseCommand):
-    help = "Bulk import from USDA FoodData Central CSV dump (with barcode dedup)"
+    help = "Bulk import from USDA FoodData Central CSV dump (streaming, with barcode dedup)"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._nutrient_cache = {}  # usda_nutrient_id -> Nutrient
+        self._nutrient_cache = {}
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -89,7 +80,6 @@ class Command(BaseCommand):
         batch_size = options["batch_size"]
         file_path = Path(options["file"]) if options["file"] else DUMP_FILE
 
-        # Ensure nutrient definitions exist
         self._load_nutrient_cache()
         if not self._nutrient_cache:
             raise CommandError(
@@ -98,7 +88,6 @@ class Command(BaseCommand):
             )
         self.stdout.write(f"Loaded {len(self._nutrient_cache)} USDA nutrient mappings.")
 
-        # Download
         if not options["skip_download"] and not options["file"]:
             self._download_dump(options["url"], file_path)
         elif not file_path.exists():
@@ -110,16 +99,19 @@ class Command(BaseCommand):
             csv_files = [n for n in zf.namelist() if n.endswith(".csv")]
             self.stdout.write(f"  Found {len(csv_files)} CSV files in archive.")
 
-            # 1) Load food.csv -> build food index
-            foods = self._read_foods(zf, limit)
+            # 1) Stream food.csv -> build food index (only relevant types)
+            self.stdout.write("  Streaming food.csv ...")
+            foods = self._stream_foods(zf, limit)
             self.stdout.write(f"  Loaded {len(foods)} foods to import.")
 
-            # 2) Load branded_food.csv for brand info + barcodes
-            brands = self._read_brands(zf, set(foods.keys()))
+            # 2) Stream branded_food.csv for brand info + barcodes
+            self.stdout.write("  Streaming branded_food.csv ...")
+            brands = self._stream_brands(zf, set(foods.keys()))
             self.stdout.write(f"  Loaded {len(brands)} brand entries.")
 
-            # 3) Load food_nutrient.csv
-            nutrients_data = self._read_food_nutrients(zf, set(foods.keys()))
+            # 3) Stream food_nutrient.csv (biggest file — MUST stream)
+            self.stdout.write("  Streaming food_nutrient.csv ...")
+            nutrients_data = self._stream_food_nutrients(zf, set(foods.keys()))
             self.stdout.write(
                 f"  Loaded nutrient data for {len(nutrients_data)} foods."
             )
@@ -193,98 +185,99 @@ class Command(BaseCommand):
         self.stdout.write(f"\nDownload complete: {downloaded / 1e6:.0f} MB")
 
     def _load_nutrient_cache(self):
-        """Cache usda_nutrient_id -> Nutrient."""
         for n in Nutrient.objects.exclude(usda_nutrient_id__isnull=True):
             self._nutrient_cache[n.usda_nutrient_id] = n
 
-    def _read_csv_from_zip(self, zf, filename):
-        """Read a CSV from the ZIP, return a list of dicts."""
-        # Find the file (might be in a subdirectory)
+    def _find_csv_in_zip(self, zf, filename):
+        """Find a CSV file inside the ZIP (might be in a subdirectory)."""
         matching = [n for n in zf.namelist() if n.endswith(f"/{filename}") or n == filename]
-        if not matching:
-            return None
-        with zf.open(matching[0]) as f:
-            text = io.TextIOWrapper(f, encoding="utf-8")
-            reader = csv.DictReader(text)
-            return list(reader)
+        return matching[0] if matching else None
 
-    def _read_foods(self, zf, limit):
-        """Read food.csv -> {fdc_id: {description, data_type, ...}}."""
-        rows = self._read_csv_from_zip(zf, "food.csv")
-        if not rows:
+    def _stream_foods(self, zf, limit):
+        """Stream food.csv -> {fdc_id: {description, data_type, ...}}."""
+        entry = self._find_csv_in_zip(zf, "food.csv")
+        if not entry:
             raise CommandError("food.csv not found in ZIP")
 
         foods = {}
-        for row in rows:
-            data_type = row.get("data_type", "").strip()
-            if data_type not in RELEVANT_DATA_TYPES:
-                continue
+        with zf.open(entry) as f:
+            reader = csv.DictReader(io.TextIOWrapper(f, encoding="utf-8"))
+            for row in reader:
+                data_type = row.get("data_type", "").strip()
+                if data_type not in RELEVANT_DATA_TYPES:
+                    continue
 
-            fdc_id = row.get("fdc_id", "").strip()
-            if not fdc_id:
-                continue
+                fdc_id = row.get("fdc_id", "").strip()
+                if not fdc_id:
+                    continue
 
-            foods[fdc_id] = {
-                "description": row.get("description", "").strip(),
-                "data_type": data_type,
-                "food_category_id": row.get("food_category_id", "").strip(),
-            }
+                foods[fdc_id] = {
+                    "description": row.get("description", "").strip(),
+                    "data_type": data_type,
+                    "food_category_id": row.get("food_category_id", "").strip(),
+                }
 
-            if limit and len(foods) >= limit:
-                break
+                if limit and len(foods) >= limit:
+                    break
 
         return foods
 
-    def _read_brands(self, zf, fdc_ids):
-        """Read branded_food.csv -> {fdc_id: {brand_owner, ingredients, gtin_upc}}."""
-        rows = self._read_csv_from_zip(zf, "branded_food.csv")
-        if not rows:
+    def _stream_brands(self, zf, fdc_ids):
+        """Stream branded_food.csv -> {fdc_id: {brand_owner, ingredients, gtin_upc}}."""
+        entry = self._find_csv_in_zip(zf, "branded_food.csv")
+        if not entry:
             return {}
 
         brands = {}
-        for row in rows:
-            fdc_id = row.get("fdc_id", "").strip()
-            if fdc_id not in fdc_ids:
-                continue
-            brands[fdc_id] = {
-                "brand_owner": (row.get("brand_owner") or "").strip() or None,
-                "brand_name": (row.get("brand_name") or "").strip() or None,
-                "ingredients": (row.get("ingredients") or "").strip() or None,
-                "gtin_upc": (row.get("gtin_upc") or "").strip() or None,
-            }
+        with zf.open(entry) as f:
+            reader = csv.DictReader(io.TextIOWrapper(f, encoding="utf-8"))
+            for row in reader:
+                fdc_id = row.get("fdc_id", "").strip()
+                if fdc_id not in fdc_ids:
+                    continue
+                brands[fdc_id] = {
+                    "brand_owner": (row.get("brand_owner") or "").strip() or None,
+                    "brand_name": (row.get("brand_name") or "").strip() or None,
+                    "ingredients": (row.get("ingredients") or "").strip() or None,
+                    "gtin_upc": (row.get("gtin_upc") or "").strip() or None,
+                }
         return brands
 
-    def _read_food_nutrients(self, zf, fdc_ids):
-        """Read food_nutrient.csv -> {fdc_id: [(nutrient_id, amount), ...]}."""
-        rows = self._read_csv_from_zip(zf, "food_nutrient.csv")
-        if not rows:
+    def _stream_food_nutrients(self, zf, fdc_ids):
+        """Stream food_nutrient.csv -> {fdc_id: [(nutrient_id, amount), ...]}."""
+        entry = self._find_csv_in_zip(zf, "food_nutrient.csv")
+        if not entry:
             raise CommandError("food_nutrient.csv not found in ZIP")
 
         data = {}
-        for row in rows:
-            fdc_id = row.get("fdc_id", "").strip()
-            if fdc_id not in fdc_ids:
-                continue
+        skipped = 0
+        with zf.open(entry) as f:
+            reader = csv.DictReader(io.TextIOWrapper(f, encoding="utf-8"))
+            for row in reader:
+                fdc_id = row.get("fdc_id", "").strip()
+                if fdc_id not in fdc_ids:
+                    skipped += 1
+                    continue
 
-            nutrient_id_str = row.get("nutrient_id", "").strip()
-            amount_str = row.get("amount", "").strip()
-            if not nutrient_id_str or not amount_str:
-                continue
+                nutrient_id_str = row.get("nutrient_id", "").strip()
+                amount_str = row.get("amount", "").strip()
+                if not nutrient_id_str or not amount_str:
+                    continue
 
-            try:
-                nutrient_id = int(nutrient_id_str)
-                amount = Decimal(amount_str)
-            except (ValueError, InvalidOperation):
-                continue
+                try:
+                    nutrient_id = int(nutrient_id_str)
+                    amount = Decimal(amount_str)
+                except (ValueError, InvalidOperation):
+                    continue
 
-            # Only keep nutrients we care about
-            if nutrient_id not in self._nutrient_cache:
-                continue
+                if nutrient_id not in self._nutrient_cache:
+                    continue
 
-            if fdc_id not in data:
-                data[fdc_id] = []
-            data[fdc_id].append((nutrient_id, amount))
+                if fdc_id not in data:
+                    data[fdc_id] = []
+                data[fdc_id].append((nutrient_id, amount))
 
+        self.stdout.write(f"    (skipped {skipped:,} irrelevant nutrient rows)")
         return data
 
     @transaction.atomic
@@ -298,7 +291,6 @@ class Command(BaseCommand):
             "dedup_linked": 0,
         }
 
-        # Check existing USDA imports
         canonical_keys = [f"usda:{fdc_id}" for fdc_id in batch_ids]
         existing = set(
             FoodItem.objects.filter(
@@ -306,7 +298,6 @@ class Command(BaseCommand):
             ).values_list("canonical_key", flat=True)
         )
 
-        # Collect barcodes for dedup check against OFF data
         barcodes_to_check = {}
         for fdc_id in batch_ids:
             brand_data = brands.get(fdc_id, {})
@@ -314,12 +305,10 @@ class Command(BaseCommand):
             if gtin and len(gtin) >= 4:
                 barcodes_to_check[fdc_id] = gtin
 
-        # Batch-lookup existing OFF products by barcode
         off_by_barcode = {}
         if barcodes_to_check:
             off_keys = [f"off:{bc}" for bc in barcodes_to_check.values()]
             for food in FoodItem.objects.filter(canonical_key__in=off_keys):
-                # Extract barcode from canonical_key "off:BARCODE"
                 bc = food.canonical_key[4:]
                 off_by_barcode[bc] = food
 
@@ -333,12 +322,9 @@ class Command(BaseCommand):
             brand_data = brands.get(fdc_id, {})
             nutrient_list = nutrients_data.get(fdc_id, [])
 
-            # Barcode-based deduplication: if USDA branded food has a barcode
-            # that already exists as an OFF product, link instead of creating new
             gtin = brand_data.get("gtin_upc")
             if gtin and gtin in off_by_barcode:
                 existing_food = off_by_barcode[gtin]
-                # Link USDA data as ImportedRecord to existing OFF FoodItem
                 ImportedRecord.objects.create(
                     source="USDA",
                     external_id=str(fdc_id),
@@ -375,13 +361,11 @@ class Command(BaseCommand):
         data_type = food_data["data_type"]
         food_type = DATA_TYPE_MAP.get(data_type, "raw")
 
-        # FoodItem
         food = FoodItem.objects.create(
             canonical_key=f"usda:{fdc_id}",
             food_type=food_type,
         )
 
-        # FoodText (USDA is English)
         brand_name = brand_data.get("brand_owner") or brand_data.get("brand_name")
         FoodText.objects.create(
             food_item=food,
@@ -391,7 +375,6 @@ class Command(BaseCommand):
             ingredients=brand_data.get("ingredients"),
         )
 
-        # ImportedRecord
         record = ImportedRecord.objects.create(
             source="USDA",
             external_id=str(fdc_id),
@@ -405,7 +388,6 @@ class Command(BaseCommand):
             food_item=food,
         )
 
-        # Nutrients
         nutrient_values = []
         energy_kcal = None
         for nutrient_id, amount in nutrient_list:
@@ -427,7 +409,6 @@ class Command(BaseCommand):
         if nutrient_values:
             FoodNutrientValue.objects.bulk_create(nutrient_values)
 
-        # Validation
         reasons = []
         if not description:
             reasons.append(("empty_name", "Description is empty"))
