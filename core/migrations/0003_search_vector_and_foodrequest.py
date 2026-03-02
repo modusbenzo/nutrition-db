@@ -71,14 +71,20 @@ class Migration(migrations.Migration):
 
     operations = [
         # ---------------------------------------------------------------
-        # FoodText: add search_vector column
+        # FoodText: add search_vector column (IF NOT EXISTS for idempotency)
         # ---------------------------------------------------------------
-        migrations.AddField(
-            model_name="foodtext",
-            name="search_vector",
-            field=django.contrib.postgres.search.SearchVectorField(
-                blank=True, null=True
-            ),
+        migrations.RunSQL(
+            sql="ALTER TABLE core_foodtext ADD COLUMN IF NOT EXISTS search_vector tsvector;",
+            reverse_sql="ALTER TABLE core_foodtext DROP COLUMN IF EXISTS search_vector;",
+            state_operations=[
+                migrations.AddField(
+                    model_name="foodtext",
+                    name="search_vector",
+                    field=django.contrib.postgres.search.SearchVectorField(
+                        blank=True, null=True
+                    ),
+                ),
+            ],
         ),
         # ---------------------------------------------------------------
         # FoodText: GIN indexes for FTS + trigram fuzzy search
