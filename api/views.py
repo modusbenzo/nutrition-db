@@ -74,8 +74,10 @@ class FoodSearchView(generics.ListAPIView):
         if not q or len(q) < 2:
             return Response({"count": 0, "results": []})
 
-        # Check cache
-        cache_key = f"search:{hashlib.md5(f'{q}:{lang}'.encode()).hexdigest()}"
+        # Check cache (include all filter params in key)
+        food_type_param = request.query_params.get("food_type", "")
+        source_param = request.query_params.get("source", "")
+        cache_key = f"search:{hashlib.md5(f'{q}:{lang}:{food_type_param}:{source_param}'.encode()).hexdigest()}"
         cached = cache.get(cache_key)
         if cached is not None:
             return Response(cached)
@@ -89,6 +91,20 @@ class FoodSearchView(generics.ListAPIView):
 
         if lang:
             qs = qs.filter(lang=lang)
+
+        # food_type filter (raw, branded, supplement)
+        food_type = request.query_params.get("food_type", "")
+        if food_type:
+            valid_types = {"raw", "branded", "supplement"}
+            types = [t.strip() for t in food_type.split(",") if t.strip() in valid_types]
+            if types:
+                qs = qs.filter(food_item__food_type__in=types)
+
+        # source filter (USDA, OFF, USER_REQ)
+        source = request.query_params.get("source", "")
+        if source:
+            sources = [s.strip() for s in source.split(",")]
+            qs = qs.filter(food_item__imported_records__source__in=sources)
 
         # Three layers of matching
         fts_filter = Q(search_vector=search_query)
