@@ -398,9 +398,10 @@ class Command(BaseCommand):
                 continue
 
             try:
-                accepted = self._import_food(
-                    fdc_id, food_tuple, brand_tuple, nutrient_list
-                )
+                with transaction.atomic():
+                    accepted = self._import_food(
+                        fdc_id, food_tuple, brand_tuple, nutrient_list
+                    )
                 result["imported"] += 1
                 if accepted:
                     result["accepted"] += 1
