@@ -42,7 +42,7 @@ from core.models import (
 )
 
 # Updated to latest USDA release (S3 direct link)
-USDA_DUMP_URL = "https://fdc-datasets.s3.amazonaws.com/FoodData_Central_csv_2025-12-18.zip"
+USDA_DUMP_URL = "https://fdc.nal.usda.gov/fdc-datasets/FoodData_Central_csv_2025-12-18.zip"
 DUMP_DIR = Path("/tmp/nutrition-imports")
 DUMP_FILE = DUMP_DIR / "FoodData_Central_csv.zip"
 
