@@ -1,12 +1,13 @@
 """
 Backfill search_vector for all existing FoodText rows.
 
-This command updates search_vector using the same logic as the DB trigger,
-but does it in batches via raw SQL for maximum speed.
+Uses cursor-based batching (WHERE id > last_id) instead of OFFSET
+for constant-speed performance regardless of table size.
 
 Usage:
     python manage.py rebuild_search_vectors
     python manage.py rebuild_search_vectors --batch-size 10000
+    python manage.py rebuild_search_vectors --only-null
 """
 
 import time
@@ -39,21 +40,26 @@ END
 
 
 class Command(BaseCommand):
-    help = "Backfill search_vector for all FoodText rows (batch SQL)"
+    help = "Backfill search_vector for all FoodText rows (cursor-based batching)"
 
     def add_arguments(self, parser):
         parser.add_argument(
             "--batch-size",
             type=int,
-            default=5000,
-            help="Number of rows to update per batch (default: 5000)",
+            default=10000,
+            help="Number of rows to update per batch (default: 10000)",
+        )
+        parser.add_argument(
+            "--only-null",
+            action="store_true",
+            help="Only update rows where search_vector IS NULL",
         )
 
     def handle(self, *args, **options):
         batch_size = options["batch_size"]
+        only_null = options["only_null"]
 
         with connection.cursor() as cursor:
-            # Count total rows
             cursor.execute("SELECT COUNT(*) FROM core_foodtext")
             total = cursor.fetchone()[0]
             self.stdout.write(f"Total FoodText rows: {total:,}")
@@ -62,7 +68,6 @@ class Command(BaseCommand):
                 self.stdout.write(self.style.WARNING("No rows to update."))
                 return
 
-            # Count rows with NULL search_vector
             cursor.execute(
                 "SELECT COUNT(*) FROM core_foodtext WHERE search_vector IS NULL"
             )
@@ -71,11 +76,15 @@ class Command(BaseCommand):
 
         t0 = time.time()
         updated = 0
-        offset = 0
+        last_id = "00000000-0000-0000-0000-000000000000"
 
-        while offset < total:
+        null_filter = "AND ft.search_vector IS NULL" if only_null else ""
+        target = null_count if only_null else total
+
+        while True:
             with connection.cursor() as cursor:
-                # Update batch using CTE for efficiency
+                # Cursor-based batching: WHERE id > last_id ORDER BY id LIMIT N
+                # This is O(1) per batch regardless of position in the table
                 sql = f"""
                     UPDATE core_foodtext ft
                     SET search_vector =
@@ -83,20 +92,28 @@ class Command(BaseCommand):
                         setweight(to_tsvector({LANG_MAP_SQL}, COALESCE(ft.brand, '')), 'B')
                     WHERE ft.id IN (
                         SELECT id FROM core_foodtext
+                        WHERE id > %s {null_filter}
                         ORDER BY id
-                        LIMIT %s OFFSET %s
+                        LIMIT %s
                     )
+                    RETURNING ft.id
                 """
-                cursor.execute(sql, [batch_size, offset])
-                rows_affected = cursor.rowcount
+                cursor.execute(sql, [last_id, batch_size])
+                rows = cursor.fetchall()
+                rows_affected = len(rows)
+
+                if rows_affected == 0:
+                    break
+
+                # last_id = max ID in this batch
+                last_id = str(rows[-1][0])
                 updated += rows_affected
 
-            offset += batch_size
             elapsed = time.time() - t0
             rate = updated / elapsed if elapsed > 0 else 0
             self.stdout.write(
-                f"  {updated:>10,} / {total:,} updated "
-                f"({updated * 100 / total:.1f}%) | "
+                f"  {updated:>10,} / {target:,} updated "
+                f"({updated * 100 / target:.1f}%) | "
                 f"{rate:,.0f}/s | "
                 f"{elapsed:.0f}s"
             )
