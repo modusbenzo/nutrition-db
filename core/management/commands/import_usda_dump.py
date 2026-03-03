@@ -147,11 +147,16 @@ class Command(BaseCommand):
                 )
 
                 # Disable search_vector trigger during bulk import (massive speedup)
-                with connection.cursor() as cur:
-                    cur.execute(
-                        "ALTER TABLE core_foodtext DISABLE TRIGGER "
-                        "foodtext_search_vector_update"
-                    )
+                trigger_exists = False
+                try:
+                    with connection.cursor() as cur:
+                        cur.execute(
+                            "ALTER TABLE core_foodtext DISABLE TRIGGER "
+                            "foodtext_search_vector_update"
+                        )
+                    trigger_exists = True
+                except Exception:
+                    self.stdout.write("    (trigger not found, skipping disable)")
 
                 # Import this chunk in DB batches
                 chunk_imported = 0
@@ -181,11 +186,12 @@ class Command(BaseCommand):
                         )
 
                 # Re-enable trigger
-                with connection.cursor() as cur:
-                    cur.execute(
-                        "ALTER TABLE core_foodtext ENABLE TRIGGER "
-                        "foodtext_search_vector_update"
-                    )
+                if trigger_exists:
+                    with connection.cursor() as cur:
+                        cur.execute(
+                            "ALTER TABLE core_foodtext ENABLE TRIGGER "
+                            "foodtext_search_vector_update"
+                        )
 
                 done = end
                 elapsed = time.time() - t0
