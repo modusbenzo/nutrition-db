@@ -381,20 +381,24 @@ class Command(BaseCommand):
             gtin = brand_tuple[3] if brand_tuple else None
             if gtin and gtin in off_by_barcode:
                 existing_food = off_by_barcode[gtin]
-                ImportedRecord.objects.create(
-                    source="USDA",
-                    external_id=str(fdc_id),
-                    raw_json={
-                        "fdc_id": fdc_id,
-                        "description": food_tuple[0],
-                        "data_type": food_tuple[1],
-                        "gtin_upc": gtin,
-                        "nutrient_count": len(nutrient_list),
-                        "dedup_note": f"Linked to existing OFF product off:{gtin}",
-                    },
-                    food_item=existing_food,
-                )
-                result["dedup_linked"] += 1
+                try:
+                    with transaction.atomic():
+                        ImportedRecord.objects.create(
+                            source="USDA",
+                            external_id=str(fdc_id),
+                            raw_json={
+                                "fdc_id": fdc_id,
+                                "description": food_tuple[0],
+                                "data_type": food_tuple[1],
+                                "gtin_upc": gtin,
+                                "nutrient_count": len(nutrient_list),
+                                "dedup_note": f"Linked to existing OFF product off:{gtin}",
+                            },
+                            food_item=existing_food,
+                        )
+                    result["dedup_linked"] += 1
+                except Exception:
+                    result["skipped"] += 1
                 continue
 
             try:
