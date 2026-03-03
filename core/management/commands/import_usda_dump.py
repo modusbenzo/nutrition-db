@@ -152,7 +152,7 @@ class Command(BaseCommand):
                     with connection.cursor() as cur:
                         cur.execute(
                             "ALTER TABLE core_foodtext DISABLE TRIGGER "
-                            "foodtext_search_vector_update"
+                            "foodtext_search_vector_trigger"
                         )
                     trigger_exists = True
                 except Exception:
@@ -190,7 +190,7 @@ class Command(BaseCommand):
                     with connection.cursor() as cur:
                         cur.execute(
                             "ALTER TABLE core_foodtext ENABLE TRIGGER "
-                            "foodtext_search_vector_update"
+                            "foodtext_search_vector_trigger"
                         )
 
                 done = end
