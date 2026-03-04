@@ -164,7 +164,6 @@ class ImportedRecordAdmin(ModelAdmin):
         "source_badge",
         "external_id",
         "show_linked",
-        "show_validation_count",
         "created_at",
     )
     list_filter = ("source",)
