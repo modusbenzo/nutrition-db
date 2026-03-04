@@ -51,8 +51,8 @@ class Command(BaseCommand):
         parser.add_argument(
             "--chunk",
             type=int,
-            default=50_000,
-            help="Batch size for indexing (default: 50000)",
+            default=25_000,
+            help="Batch size for indexing (default: 25000)",
         )
         parser.add_argument(
             "--clear",
@@ -81,10 +81,9 @@ class Command(BaseCommand):
             self.stdout.write("Deleting existing index...")
             try:
                 client.delete_index(INDEX_NAME)
-                # Wait for deletion to complete
                 time.sleep(2)
             except meilisearch.errors.MeilisearchApiError:
-                pass  # Index doesn't exist yet
+                pass
             self.stdout.write("Index deleted.")
 
         # Create or get index
@@ -102,35 +101,17 @@ class Command(BaseCommand):
         self._wait_for_task(client, task)
         self.stdout.write("Settings applied.")
 
-        # Load all sources for each food_item (batch)
-        self.stdout.write("Loading source data...")
-        from core.models import ImportedRecord
-
-        source_map = {}
-        for rec in ImportedRecord.objects.values_list("food_item_id", "source"):
-            source_map.setdefault(rec[0], set()).add(rec[1])
-        self.stdout.write(f"  Loaded sources for {len(source_map):,} foods")
-
-        # Load all nutrients (batch)
-        self.stdout.write("Loading nutrient data...")
-        from core.models import FoodNutrientValue
-
-        nutrients_map = {}
-        for nv in (
-            FoodNutrientValue.objects.filter(basis="per_100g")
-            .select_related("nutrient")
-            .only("food_item_id", "nutrient__canonical_code", "amount")
-        ):
-            nutrients_map.setdefault(nv.food_item_id, {})[
-                nv.nutrient.canonical_code
-            ] = float(nv.amount)
-        self.stdout.write(f"  Loaded nutrients for {len(nutrients_map):,} foods")
-
-        # Stream FoodText in chunks
-        from core.models import FoodText
+        # Stream FoodText in chunks — load sources + nutrients per chunk
+        # to avoid OOM from loading everything at once
+        from core.models import FoodNutrientValue, FoodText, ImportedRecord
 
         total = FoodText.objects.count()
-        self.stdout.write(f"\nIndexing {total:,} FoodText rows in chunks of {chunk_size:,}...")
+        self.stdout.write(
+            f"\nIndexing {total:,} FoodText rows in chunks of {chunk_size:,}..."
+        )
+        self.stdout.write(
+            "  (sources + nutrients loaded per chunk to save memory)\n"
+        )
 
         t0 = time.time()
         indexed = 0
@@ -145,6 +126,32 @@ class Command(BaseCommand):
             if not batch:
                 break
 
+            # Collect food_item IDs for this chunk
+            food_item_ids = list({ft.food_item_id for ft in batch})
+
+            # Load sources for this chunk only
+            source_map = {}
+            for fid, src in (
+                ImportedRecord.objects.filter(food_item_id__in=food_item_ids)
+                .values_list("food_item_id", "source")
+            ):
+                source_map.setdefault(fid, set()).add(src)
+
+            # Load nutrients for this chunk only
+            nutrients_map = {}
+            for nv in (
+                FoodNutrientValue.objects.filter(
+                    food_item_id__in=food_item_ids,
+                    basis="per_100g",
+                )
+                .select_related("nutrient")
+                .only("food_item_id", "nutrient__canonical_code", "amount")
+            ):
+                nutrients_map.setdefault(nv.food_item_id, {})[
+                    nv.nutrient.canonical_code
+                ] = float(nv.amount)
+
+            # Build documents
             documents = []
             for ft in batch:
                 food_item = ft.food_item
@@ -161,8 +168,12 @@ class Command(BaseCommand):
                 }
                 documents.append(doc)
 
+            # Send to Meilisearch
             task = index.add_documents(documents)
             self._wait_for_task(client, task)
+
+            # Free memory
+            del source_map, nutrients_map, documents, food_item_ids
 
             last_id = batch[-1].id
             indexed += len(batch)
