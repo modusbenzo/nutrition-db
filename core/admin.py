@@ -20,10 +20,13 @@ from .models import (
 
 def rejected_count(request):
     """Badge callback for sidebar -- shows number of items needing review."""
-    count = ValidationEvent.objects.filter(
-        status__in=["rejected", "needs_review"]
-    ).count()
-    return count if count > 0 else None
+    try:
+        count = ValidationEvent.objects.filter(
+            status__in=["rejected", "needs_review"]
+        ).count()
+        return count if count > 0 else None
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -62,24 +65,19 @@ class FoodItemAdmin(ModelAdmin):
         "show_name",
         "show_brand",
         "food_type_badge",
-        "show_nutrient_count",
         "updated_at",
     )
     list_filter = ("food_type",)
-    search_fields = ("canonical_key", "texts__name", "texts__brand")
+    search_fields = ("canonical_key",)
     list_per_page = 30
+    show_full_result_count = False
     readonly_fields = ("id", "created_at", "updated_at")
     inlines = [FoodTextInline, FoodNutrientValueInline]
 
     def get_queryset(self, request):
-        return (
-            super()
-            .get_queryset(request)
-            .prefetch_related("texts")
-            .annotate(nutrient_count=Count("nutrient_values"))
-        )
+        return super().get_queryset(request).prefetch_related("texts")
 
-    @display(description="Name", ordering="texts__name")
+    @display(description="Name")
     def show_name(self, obj):
         text = obj.texts.first()
         return text.name if text else "-"
@@ -95,15 +93,10 @@ class FoodItemAdmin(ModelAdmin):
             "raw": "success",
             "branded": "info",
             "supplement": "warning",
-            "recipe": "primary",
         },
     )
     def food_type_badge(self, obj):
         return obj.food_type
-
-    @display(description="Nahrstoffe")
-    def show_nutrient_count(self, obj):
-        return obj.nutrient_count
 
 
 # ---------------------------------------------------------------------------
@@ -113,8 +106,9 @@ class FoodItemAdmin(ModelAdmin):
 class FoodTextAdmin(ModelAdmin):
     list_display = ("name", "lang", "brand", "food_item")
     list_filter = ("lang",)
-    search_fields = ("name", "brand")
+    search_fields = ("name",)
     list_per_page = 30
+    show_full_result_count = False
     autocomplete_fields = ("food_item",)
 
 
@@ -155,9 +149,10 @@ class NutrientAdmin(ModelAdmin):
 class FoodNutrientValueAdmin(ModelAdmin):
     list_display = ("food_item", "nutrient", "basis", "amount", "unit")
     list_filter = ("basis", "nutrient__category")
-    search_fields = ("food_item__canonical_key", "nutrient__canonical_code")
+    search_fields = ("food_item__canonical_key",)
     autocomplete_fields = ("food_item", "nutrient")
     list_per_page = 30
+    show_full_result_count = False
 
 
 # ---------------------------------------------------------------------------
@@ -177,15 +172,11 @@ class ImportedRecordAdmin(ModelAdmin):
     readonly_fields = ("id", "created_at", "raw_json_pretty")
     autocomplete_fields = ("food_item",)
     list_per_page = 30
+    show_full_result_count = False
     inlines = [ValidationEventInline]
 
     def get_queryset(self, request):
-        return (
-            super()
-            .get_queryset(request)
-            .select_related("food_item")
-            .annotate(validation_count=Count("validations"))
-        )
+        return super().get_queryset(request).select_related("food_item")
 
     @display(
         description="Quelle",
@@ -202,10 +193,6 @@ class ImportedRecordAdmin(ModelAdmin):
                 obj.food_item.canonical_key[:40],
             )
         return format_html('<span style="color:red">&#10007;</span>')
-
-    @display(description="Validierungen")
-    def show_validation_count(self, obj):
-        return obj.validation_count
 
     def raw_json_pretty(self, obj):
         pretty = json.dumps(obj.raw_json, indent=2, ensure_ascii=False)
@@ -232,7 +219,8 @@ class ValidationEventAdmin(ModelAdmin):
         "created_at",
     )
     list_filter = ("status", "reason_code")
-    search_fields = ("imported_record__external_id", "reason_code", "reason_text")
+    search_fields = ("imported_record__external_id",)
+    show_full_result_count = False
     readonly_fields = (
         "id",
         "created_at",
