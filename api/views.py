@@ -31,6 +31,33 @@ from .serializers import (
 
 logger = logging.getLogger(__name__)
 
+
+def index_food_in_meilisearch(food_item, food_text, nutrients=None, sources=None):
+    """
+    Index a single food item into Meilisearch (live sync).
+    Called after auto-creation from FoodRequest.
+    Silently fails if Meilisearch is unavailable — no impact on the request.
+    """
+    meili = _get_meili()
+    if not meili:
+        return
+
+    try:
+        doc = {
+            "id": str(food_text.id),
+            "food_item_id": str(food_item.id),
+            "canonical_key": food_item.canonical_key,
+            "food_type": food_item.food_type,
+            "name": food_text.name or "",
+            "brand": food_text.brand or "",
+            "lang": food_text.lang,
+            "source": list(sources) if sources else ["USER_REQ"],
+            "nutrients": nutrients or {},
+        }
+        meili.index("foods").add_documents([doc])
+    except Exception as e:
+        logger.warning("Failed to index food %s in Meilisearch: %s", food_item.id, e)
+
 # Map BCP 47 lang codes to PostgreSQL text search config names (fallback)
 PG_LANG_MAP = {
     "de": "german",
@@ -544,6 +571,17 @@ class FoodRequestCreateView(generics.CreateAPIView):
 
                 if values_to_create:
                     FoodNutrientValue.objects.bulk_create(values_to_create)
+
+            # Live-index into Meilisearch
+            food_text = FoodText.objects.filter(food_item=food).first()
+            if food_text:
+                index_food_in_meilisearch(
+                    food_item=food,
+                    food_text=food_text,
+                    nutrients={code: float(amt) for code, amt in nutrients.items()
+                               if code in nutrient_objs} if nutrients else {},
+                    sources=["USER_REQ"],
+                )
 
             return food
 
