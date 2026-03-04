@@ -1,16 +1,16 @@
 """
 API views for Nutrition Core Database.
 
-Search uses 3-layer PostgreSQL ranking:
-  1. Full-Text Search (tsvector + SearchQuery) — stemming-aware, weighted
-  2. Trigram Similarity (pg_trgm) — fuzzy/typo-tolerant
-  3. Exact Prefix Bonus — "Banane" ranks higher than "Banana Bread"
+Search is powered by Meilisearch for instant (<50ms) results.
+Falls back to PostgreSQL FTS if Meilisearch is unavailable.
 
 FoodRequest allows apps to submit missing food data for auto-creation.
 """
 
 import hashlib
+import logging
 
+from django.conf import settings as django_settings
 from django.contrib.postgres.search import SearchQuery, SearchRank, TrigramSimilarity
 from django.core.cache import cache
 from django.db.models import Case, F, FloatField, Q, Value, When
@@ -29,8 +29,9 @@ from .serializers import (
     FoodRequestResponseSerializer,
 )
 
+logger = logging.getLogger(__name__)
 
-# Map BCP 47 lang codes to PostgreSQL text search config names
+# Map BCP 47 lang codes to PostgreSQL text search config names (fallback)
 PG_LANG_MAP = {
     "de": "german",
     "en": "english",
@@ -51,15 +52,38 @@ PG_LANG_MAP = {
 
 CACHE_TTL = 300  # 5 minutes
 
+# ---------------------------------------------------------------------------
+# Meilisearch client (lazy singleton)
+# ---------------------------------------------------------------------------
+_meili_client = None
+
+
+def _get_meili():
+    """Get or create Meilisearch client. Returns None if unavailable."""
+    global _meili_client
+    if _meili_client is not None:
+        return _meili_client
+    try:
+        import meilisearch
+        _meili_client = meilisearch.Client(
+            django_settings.MEILISEARCH_URL,
+            django_settings.MEILISEARCH_MASTER_KEY,
+        )
+        # Quick health check
+        _meili_client.health()
+        return _meili_client
+    except Exception as e:
+        logger.warning("Meilisearch unavailable, falling back to PostgreSQL: %s", e)
+        _meili_client = None
+        return None
+
 
 class FoodSearchView(generics.ListAPIView):
     """
     GET /api/foods/search?q=Banane&lang=de&limit=25&offset=0
 
-    3-layer search:
-      1. FTS (SearchRank) — weighted by name (A) and brand (B)
-      2. Trigram similarity — fuzzy matching for typos
-      3. Prefix bonus — exact prefix gets +1.0
+    Primary: Meilisearch (instant, typo-tolerant, ranked)
+    Fallback: PostgreSQL FTS + trigram (if Meilisearch is down)
 
     Returns flat JSON for maximum speed.
     """
@@ -82,37 +106,144 @@ class FoodSearchView(generics.ListAPIView):
         if cached is not None:
             return Response(cached)
 
-        # Determine PostgreSQL text search config
-        pg_config = PG_LANG_MAP.get(lang, "simple")
-        search_query = SearchQuery(q, config=pg_config, search_type="plain")
-
-        # Build queryset on FoodText
-        qs = FoodText.objects.select_related("food_item")
-
-        if lang:
-            qs = qs.filter(lang=lang)
-
-        # food_type filter (raw, branded, supplement)
-        food_type = request.query_params.get("food_type", "")
-        if food_type:
-            valid_types = {"raw", "branded", "supplement"}
-            types = [t.strip() for t in food_type.split(",") if t.strip() in valid_types]
-            if types:
-                qs = qs.filter(food_item__food_type__in=types)
-
-        # source filter (USDA, OFF, USER_REQ)
-        source = request.query_params.get("source", "")
-        if source:
-            sources = [s.strip() for s in source.split(",")]
-            qs = qs.filter(food_item__imported_records__source__in=sources)
-
         # Parse pagination params
         limit = int(request.query_params.get("limit", 25))
         limit = min(limit, 100)
         offset = int(request.query_params.get("offset", 0))
 
-        # Strategy: FTS first (fast, uses GIN index). Only fall back to
-        # trigram (slow, scans more rows) if FTS returns too few results.
+        # Try Meilisearch first
+        meili = _get_meili()
+        if meili:
+            try:
+                response_data = self._search_meilisearch(
+                    meili, q, lang, food_type_param, source_param,
+                    limit, offset, request,
+                )
+                cache.set(cache_key, response_data, CACHE_TTL)
+                return Response(response_data)
+            except Exception as e:
+                logger.warning("Meilisearch search failed, falling back: %s", e)
+
+        # Fallback to PostgreSQL
+        response_data = self._search_postgres(
+            q, lang, food_type_param, source_param, limit, offset, request,
+        )
+        cache.set(cache_key, response_data, CACHE_TTL)
+        return Response(response_data)
+
+    # ------------------------------------------------------------------
+    # Meilisearch search
+    # ------------------------------------------------------------------
+    def _search_meilisearch(
+        self, client, q, lang, food_type_param, source_param,
+        limit, offset, request,
+    ):
+        """Search via Meilisearch — typically <50ms."""
+        index = client.index("foods")
+
+        # Build filter expressions
+        filters = []
+        if lang:
+            filters.append(f'lang = "{lang}"')
+
+        if food_type_param:
+            valid_types = {"raw", "branded", "supplement"}
+            types = [t.strip() for t in food_type_param.split(",") if t.strip() in valid_types]
+            if types:
+                if len(types) == 1:
+                    filters.append(f'food_type = "{types[0]}"')
+                else:
+                    or_parts = " OR ".join(f'food_type = "{t}"' for t in types)
+                    filters.append(f"({or_parts})")
+
+        if source_param:
+            sources = [s.strip() for s in source_param.split(",") if s.strip()]
+            if sources:
+                if len(sources) == 1:
+                    filters.append(f'source = "{sources[0]}"')
+                else:
+                    or_parts = " OR ".join(f'source = "{s}"' for s in sources)
+                    filters.append(f"({or_parts})")
+
+        search_params = {
+            "limit": limit,
+            "offset": offset,
+            "attributesToRetrieve": [
+                "id", "food_item_id", "canonical_key", "food_type",
+                "name", "brand", "lang", "nutrients",
+            ],
+        }
+        if filters:
+            search_params["filter"] = " AND ".join(filters)
+
+        result = index.search(q, search_params)
+
+        # Build response matching our API format
+        results = []
+        for hit in result["hits"]:
+            results.append({
+                "id": hit["food_item_id"],
+                "canonical_key": hit["canonical_key"],
+                "food_type": hit["food_type"],
+                "name": hit["name"],
+                "brand": hit.get("brand") or None,
+                "lang": hit["lang"],
+                "nutrients": hit.get("nutrients", {}),
+                "score": round(hit.get("_rankingScore", 0), 4) if "_rankingScore" in hit else 0,
+            })
+
+        total_count = result.get("estimatedTotalHits", len(results))
+
+        # Build pagination URLs
+        base_url = request.build_absolute_uri(request.path)
+        params = request.query_params.copy()
+
+        next_url = None
+        if offset + limit < total_count:
+            params["offset"] = offset + limit
+            params["limit"] = limit
+            next_url = f"{base_url}?{'&'.join(f'{k}={v}' for k, v in params.items())}"
+
+        prev_url = None
+        if offset > 0:
+            params["offset"] = max(0, offset - limit)
+            params["limit"] = limit
+            prev_url = f"{base_url}?{'&'.join(f'{k}={v}' for k, v in params.items())}"
+
+        return {
+            "count": total_count,
+            "next": next_url,
+            "previous": prev_url,
+            "results": results,
+        }
+
+    # ------------------------------------------------------------------
+    # PostgreSQL fallback (same as before)
+    # ------------------------------------------------------------------
+    def _search_postgres(
+        self, q, lang, food_type_param, source_param,
+        limit, offset, request,
+    ):
+        """Fallback: PostgreSQL FTS-first with trigram fallback."""
+        pg_config = PG_LANG_MAP.get(lang, "simple")
+        search_query = SearchQuery(q, config=pg_config, search_type="plain")
+
+        qs = FoodText.objects.select_related("food_item")
+
+        if lang:
+            qs = qs.filter(lang=lang)
+
+        if food_type_param:
+            valid_types = {"raw", "branded", "supplement"}
+            types = [t.strip() for t in food_type_param.split(",") if t.strip() in valid_types]
+            if types:
+                qs = qs.filter(food_item__food_type__in=types)
+
+        if source_param:
+            sources = [s.strip() for s in source_param.split(",")]
+            qs = qs.filter(food_item__imported_records__source__in=sources)
+
+        # FTS first
         fts_qs = qs.filter(search_vector=search_query).annotate(
             fts_rank=SearchRank(F("search_vector"), search_query),
             prefix_bonus=Case(
@@ -129,17 +260,14 @@ class FoodSearchView(generics.ListAPIView):
             ),
         ).order_by("-score", "name")
 
-        # Check if FTS gives enough results
         needed = offset + limit
         fts_results = list(fts_qs[:needed + 1])
         has_more_fts = len(fts_results) > needed
 
         if len(fts_results) >= needed or has_more_fts:
-            # FTS has enough results — use them directly
             page = fts_results[offset:offset + limit]
             total_count = offset + len(fts_results)
         else:
-            # FTS returned too few — fall back to trigram (slower)
             trigram_qs = qs.filter(
                 Q(name__trigram_similar=q) | Q(name__istartswith=q)
             ).annotate(
@@ -160,7 +288,6 @@ class FoodSearchView(generics.ListAPIView):
                 ),
             ).order_by("-score", "name")
 
-            # Merge: FTS results first, then trigram results
             fts_ids = {ft.id for ft in fts_results}
             trigram_results = [
                 ft for ft in trigram_qs[:needed]
@@ -170,10 +297,8 @@ class FoodSearchView(generics.ListAPIView):
             page = combined[offset:offset + limit]
             total_count = len(combined)
 
-        # Collect food_item IDs for batch nutrient loading
+        # Batch load nutrients
         food_item_ids = [ft.food_item_id for ft in page]
-
-        # Batch load nutrients (avoid N+1)
         nutrients_map = {}
         if food_item_ids:
             nutrient_values = (
@@ -188,23 +313,19 @@ class FoodSearchView(generics.ListAPIView):
                     nv.nutrient.canonical_code
                 ] = float(nv.amount)
 
-        # Build flat results
         results = []
         for ft in page:
-            results.append(
-                {
-                    "id": str(ft.food_item.id),
-                    "canonical_key": ft.food_item.canonical_key,
-                    "food_type": ft.food_item.food_type,
-                    "name": ft.name,
-                    "brand": ft.brand,
-                    "lang": ft.lang,
-                    "nutrients": nutrients_map.get(ft.food_item_id, {}),
-                    "score": round(float(ft.score), 4) if hasattr(ft, "score") else 0,
-                }
-            )
+            results.append({
+                "id": str(ft.food_item.id),
+                "canonical_key": ft.food_item.canonical_key,
+                "food_type": ft.food_item.food_type,
+                "name": ft.name,
+                "brand": ft.brand,
+                "lang": ft.lang,
+                "nutrients": nutrients_map.get(ft.food_item_id, {}),
+                "score": round(float(ft.score), 4) if hasattr(ft, "score") else 0,
+            })
 
-        # Build paginated response manually
         base_url = request.build_absolute_uri(request.path)
         params = request.query_params.copy()
 
@@ -220,17 +341,12 @@ class FoodSearchView(generics.ListAPIView):
             params["limit"] = limit
             prev_url = f"{base_url}?{'&'.join(f'{k}={v}' for k, v in params.items())}"
 
-        response_data = {
+        return {
             "count": total_count,
             "next": next_url,
             "previous": prev_url,
             "results": results,
         }
-
-        # Cache the response (5 min TTL)
-        cache.set(cache_key, response_data, CACHE_TTL)
-
-        return Response(response_data)
 
 
 class FoodDetailView(generics.RetrieveAPIView):

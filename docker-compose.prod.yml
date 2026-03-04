@@ -26,8 +26,32 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      meilisearch:
+        condition: service_healthy
     volumes:
       - /tmp/nutrition-imports:/tmp/nutrition-imports
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.12
+    restart: always
+    environment:
+      - MEILI_MASTER_KEY=${MEILI_MASTER_KEY:-changeme-in-production}
+      - MEILI_ENV=production
+      - MEILI_DB_PATH=/meili_data
+      - MEILI_MAX_INDEXING_MEMORY=1024Mb
+    volumes:
+      - meili_data:/meili_data
+    expose:
+      - "7700"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
     deploy:
       resources:
         limits:
@@ -54,3 +78,4 @@ services:
 
 volumes:
   pgdata:
+  meili_data:
