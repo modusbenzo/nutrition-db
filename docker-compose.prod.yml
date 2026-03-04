@@ -15,7 +15,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512M
+          memory: 1536M
 
   web:
     build: .
@@ -31,7 +31,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 768M
+          memory: 1536M
 
   # Backup: manuell oder per Cronjob
   backup:
