@@ -32,11 +32,12 @@ from .serializers import (
 logger = logging.getLogger(__name__)
 
 
-def index_food_in_meilisearch(food_item, food_text, nutrients=None, sources=None):
+def index_food_in_meilisearch(food_item, food_text, sources=None):
     """
     Index a single food item into Meilisearch (live sync).
     Called after auto-creation from FoodRequest.
-    Silently fails if Meilisearch is unavailable — no impact on the request.
+    Nutrients are NOT stored in Meili — loaded from PG at query time.
+    Silently fails if Meilisearch is unavailable.
     """
     meili = _get_meili()
     if not meili:
@@ -52,7 +53,6 @@ def index_food_in_meilisearch(food_item, food_text, nutrients=None, sources=None
             "brand": food_text.brand or "",
             "lang": food_text.lang,
             "source": list(sources) if sources else ["USER_REQ"],
-            "nutrients": nutrients or {},
         }
         meili.index("foods").add_documents([doc])
     except Exception as e:
@@ -197,13 +197,28 @@ class FoodSearchView(generics.ListAPIView):
             "offset": offset,
             "attributesToRetrieve": [
                 "id", "food_item_id", "canonical_key", "food_type",
-                "name", "brand", "lang", "nutrients",
+                "name", "brand", "lang",
             ],
         }
         if filters:
             search_params["filter"] = " AND ".join(filters)
 
         result = index.search(q, search_params)
+
+        # Load nutrients from PostgreSQL for the hits
+        food_item_ids = [hit["food_item_id"] for hit in result["hits"]]
+        nutrients_map = {}
+        if food_item_ids:
+            from core.models import FoodNutrientValue
+            for nv in (
+                FoodNutrientValue.objects.filter(
+                    food_item_id__in=food_item_ids,
+                    basis="per_100g",
+                ).select_related("nutrient")
+            ):
+                nutrients_map.setdefault(str(nv.food_item_id), {})[
+                    nv.nutrient.canonical_code
+                ] = float(nv.amount)
 
         # Build response matching our API format
         results = []
@@ -215,7 +230,7 @@ class FoodSearchView(generics.ListAPIView):
                 "name": hit["name"],
                 "brand": hit.get("brand") or None,
                 "lang": hit["lang"],
-                "nutrients": hit.get("nutrients", {}),
+                "nutrients": nutrients_map.get(hit["food_item_id"], {}),
                 "score": round(hit.get("_rankingScore", 0), 4) if "_rankingScore" in hit else 0,
             })
 
@@ -578,8 +593,6 @@ class FoodRequestCreateView(generics.CreateAPIView):
                 index_food_in_meilisearch(
                     food_item=food,
                     food_text=food_text,
-                    nutrients={code: float(amt) for code, amt in nutrients.items()
-                               if code in nutrient_objs} if nutrients else {},
                     sources=["USER_REQ"],
                 )
 

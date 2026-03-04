@@ -1,5 +1,8 @@
 """
-Management command to index FoodText + nutrients into Meilisearch.
+Management command to index FoodText into Meilisearch.
+
+Nutrients are NOT stored in Meilisearch (saves ~15GB disk).
+They are loaded from PostgreSQL after search results come back.
 
 Usage:
     python manage.py index_meilisearch              # full reindex
@@ -30,7 +33,6 @@ SETTINGS = {
         "sort",
         "exactness",
     ],
-    # Typo tolerance tuning — be lenient for long food names
     "typoTolerance": {
         "enabled": True,
         "minWordSizeForTypos": {
@@ -51,8 +53,8 @@ class Command(BaseCommand):
         parser.add_argument(
             "--chunk",
             type=int,
-            default=25_000,
-            help="Batch size for indexing (default: 25000)",
+            default=50_000,
+            help="Batch size for indexing (default: 50000)",
         )
         parser.add_argument(
             "--clear",
@@ -101,17 +103,15 @@ class Command(BaseCommand):
         self._wait_for_task(client, task)
         self.stdout.write("Settings applied.")
 
-        # Stream FoodText in chunks — load sources + nutrients per chunk
-        # to avoid OOM from loading everything at once
-        from core.models import FoodNutrientValue, FoodText, ImportedRecord
+        # Stream FoodText in chunks — sources loaded per chunk
+        # Nutrients are NOT indexed (saves ~15GB disk, loaded from PG at query time)
+        from core.models import FoodText, ImportedRecord
 
         total = FoodText.objects.count()
         self.stdout.write(
             f"\nIndexing {total:,} FoodText rows in chunks of {chunk_size:,}..."
         )
-        self.stdout.write(
-            "  (sources + nutrients loaded per chunk to save memory)\n"
-        )
+        self.stdout.write("  (nutrients not indexed — loaded from PostgreSQL at query time)\n")
 
         t0 = time.time()
         indexed = 0
@@ -137,21 +137,7 @@ class Command(BaseCommand):
             ):
                 source_map.setdefault(fid, set()).add(src)
 
-            # Load nutrients for this chunk only
-            nutrients_map = {}
-            for nv in (
-                FoodNutrientValue.objects.filter(
-                    food_item_id__in=food_item_ids,
-                    basis="per_100g",
-                )
-                .select_related("nutrient")
-                .only("food_item_id", "nutrient__canonical_code", "amount")
-            ):
-                nutrients_map.setdefault(nv.food_item_id, {})[
-                    nv.nutrient.canonical_code
-                ] = float(nv.amount)
-
-            # Build documents
+            # Build documents (no nutrients — keeps index small)
             documents = []
             for ft in batch:
                 food_item = ft.food_item
@@ -164,7 +150,6 @@ class Command(BaseCommand):
                     "brand": ft.brand or "",
                     "lang": ft.lang,
                     "source": list(source_map.get(food_item.id, [])),
-                    "nutrients": nutrients_map.get(food_item.id, {}),
                 }
                 documents.append(doc)
 
@@ -173,7 +158,7 @@ class Command(BaseCommand):
             self._wait_for_task(client, task)
 
             # Free memory
-            del source_map, nutrients_map, documents, food_item_ids
+            del source_map, documents, food_item_ids
 
             last_id = batch[-1].id
             indexed += len(batch)
@@ -193,8 +178,11 @@ class Command(BaseCommand):
         )
 
         # Show index stats
-        stats = index.get_stats()
-        self.stdout.write(f"Index stats: {stats['numberOfDocuments']:,} documents")
+        try:
+            stats = index.get_stats()
+            self.stdout.write(f"Index stats: {stats.number_of_documents:,} documents")
+        except Exception:
+            self.stdout.write("(Could not fetch index stats)")
 
     def _wait_for_task(self, client, task_info):
         """Wait for a Meilisearch task to complete."""
