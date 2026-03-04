@@ -106,40 +106,69 @@ class FoodSearchView(generics.ListAPIView):
             sources = [s.strip() for s in source.split(",")]
             qs = qs.filter(food_item__imported_records__source__in=sources)
 
-        # Three layers of matching
-        fts_filter = Q(search_vector=search_query)
-        trigram_filter = Q(name__trigram_similar=q)
-        prefix_filter = Q(name__istartswith=q)
+        # Parse pagination params
+        limit = int(request.query_params.get("limit", 25))
+        limit = min(limit, 100)
+        offset = int(request.query_params.get("offset", 0))
 
-        qs = qs.filter(fts_filter | trigram_filter | prefix_filter)
-
-        # Annotate scores
-        qs = qs.annotate(
+        # Strategy: FTS first (fast, uses GIN index). Only fall back to
+        # trigram (slow, scans more rows) if FTS returns too few results.
+        fts_qs = qs.filter(search_vector=search_query).annotate(
             fts_rank=SearchRank(F("search_vector"), search_query),
-            trigram_sim=TrigramSimilarity("name", q),
             prefix_bonus=Case(
                 When(name__istartswith=q, then=Value(1.0)),
                 default=Value(0.0),
                 output_field=FloatField(),
             ),
-        )
-
-        # Combined score: MAX(fts_rank * 2, trigram_sim) + prefix_bonus
-        qs = qs.annotate(
-            score=Greatest(
-                F("fts_rank") * Value(2.0, output_field=FloatField()),
-                F("trigram_sim"),
+            score=SearchRank(F("search_vector"), search_query)
+            * Value(2.0, output_field=FloatField())
+            + Case(
+                When(name__istartswith=q, then=Value(1.0)),
+                default=Value(0.0),
                 output_field=FloatField(),
-            )
-            + F("prefix_bonus"),
-        )
+            ),
+        ).order_by("-score", "name")
 
-        qs = qs.order_by("-score", "name")
+        # Check if FTS gives enough results
+        needed = offset + limit
+        fts_results = list(fts_qs[:needed + 1])
+        has_more_fts = len(fts_results) > needed
 
-        # Paginate
-        page = self.paginate_queryset(qs)
-        if page is None:
-            page = list(qs[:25])
+        if len(fts_results) >= needed or has_more_fts:
+            # FTS has enough results — use them directly
+            page = fts_results[offset:offset + limit]
+            total_count = offset + len(fts_results)
+        else:
+            # FTS returned too few — fall back to trigram (slower)
+            trigram_qs = qs.filter(
+                Q(name__trigram_similar=q) | Q(name__istartswith=q)
+            ).annotate(
+                trigram_sim=TrigramSimilarity("name", q),
+                prefix_bonus=Case(
+                    When(name__istartswith=q, then=Value(1.0)),
+                    default=Value(0.0),
+                    output_field=FloatField(),
+                ),
+                score=Greatest(
+                    TrigramSimilarity("name", q),
+                    Value(0.0),
+                    output_field=FloatField(),
+                ) + Case(
+                    When(name__istartswith=q, then=Value(1.0)),
+                    default=Value(0.0),
+                    output_field=FloatField(),
+                ),
+            ).order_by("-score", "name")
+
+            # Merge: FTS results first, then trigram results
+            fts_ids = {ft.id for ft in fts_results}
+            trigram_results = [
+                ft for ft in trigram_qs[:needed]
+                if ft.id not in fts_ids
+            ]
+            combined = fts_results + trigram_results
+            page = combined[offset:offset + limit]
+            total_count = len(combined)
 
         # Collect food_item IDs for batch nutrient loading
         food_item_ids = [ft.food_item_id for ft in page]
@@ -175,7 +204,28 @@ class FoodSearchView(generics.ListAPIView):
                 }
             )
 
-        response_data = self.get_paginated_response(results).data
+        # Build paginated response manually
+        base_url = request.build_absolute_uri(request.path)
+        params = request.query_params.copy()
+
+        next_url = None
+        if offset + limit < total_count:
+            params["offset"] = offset + limit
+            params["limit"] = limit
+            next_url = f"{base_url}?{'&'.join(f'{k}={v}' for k, v in params.items())}"
+
+        prev_url = None
+        if offset > 0:
+            params["offset"] = max(0, offset - limit)
+            params["limit"] = limit
+            prev_url = f"{base_url}?{'&'.join(f'{k}={v}' for k, v in params.items())}"
+
+        response_data = {
+            "count": total_count,
+            "next": next_url,
+            "previous": prev_url,
+            "results": results,
+        }
 
         # Cache the response (5 min TTL)
         cache.set(cache_key, response_data, CACHE_TTL)

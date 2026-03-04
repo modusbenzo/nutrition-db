@@ -109,12 +109,12 @@ REST_FRAMEWORK = {
 }
 
 # ---------------------------------------------------------------------------
-# Caches — in-memory cache for search results (5 min TTL)
+# Caches — DB cache shared across all gunicorn workers
 # ---------------------------------------------------------------------------
 CACHES = {
     "default": {
-        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
-        "LOCATION": "nutrition-search-cache",
+        "BACKEND": "django.core.cache.backends.db.DatabaseCache",
+        "LOCATION": "search_cache",
         "TIMEOUT": 300,  # 5 minutes
     }
 }
