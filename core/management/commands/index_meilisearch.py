@@ -30,8 +30,8 @@ SETTINGS = {
         "typo",
         "proximity",
         "attribute",
-        "sort",
         "exactness",
+        "sort",
     ],
     "typoTolerance": {
         "enabled": True,

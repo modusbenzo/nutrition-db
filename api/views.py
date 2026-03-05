@@ -195,6 +195,7 @@ class FoodSearchView(generics.ListAPIView):
         search_params = {
             "limit": limit,
             "offset": offset,
+            "showRankingScore": True,
             "attributesToRetrieve": [
                 "id", "food_item_id", "canonical_key", "food_type",
                 "name", "brand", "lang",
