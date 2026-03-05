@@ -24,14 +24,14 @@ INDEX_NAME = "foods"
 SETTINGS = {
     "searchableAttributes": ["name", "brand"],
     "filterableAttributes": ["lang", "food_type", "source"],
-    "sortableAttributes": ["name"],
+    "sortableAttributes": ["name", "name_length"],
     "rankingRules": [
         "words",
         "typo",
         "proximity",
         "attribute",
         "exactness",
-        "sort",
+        "name_length:asc",
     ],
     "typoTolerance": {
         "enabled": True,
@@ -141,12 +141,14 @@ class Command(BaseCommand):
             documents = []
             for ft in batch:
                 food_item = ft.food_item
+                name = ft.name or ""
                 doc = {
                     "id": str(ft.id),
                     "food_item_id": str(food_item.id),
                     "canonical_key": food_item.canonical_key,
                     "food_type": food_item.food_type,
-                    "name": ft.name or "",
+                    "name": name,
+                    "name_length": len(name),
                     "brand": ft.brand or "",
                     "lang": ft.lang,
                     "source": list(source_map.get(food_item.id, [])),
