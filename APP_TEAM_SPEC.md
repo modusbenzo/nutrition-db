@@ -267,11 +267,16 @@ Beispiel: User sagt "ESN Protein" → Suche: `?q=ESN+Protein&food_type=branded&l
 ### Fertiggerichte (Döner, Pizza, etc.)
 
 Für Fertiggerichte wie "Döner", "Big Mac", "Pizza Margherita":
-**Die Grammzahl IMMER über GPT-Schätzung bestimmen, NICHT aus der DB.**
 
-Die DB liefert Nährwerte pro 100g. Die App muss wissen wie schwer ein Döner ist.
-→ GPT schätzen lassen: "Wie schwer ist ein durchschnittlicher Döner Kebab?" (~350g)
-→ Dann: `nährwert * (350 / 100)`
+1. **Suche OHNE `food_type`-Filter** — Fertiggerichte sind weder `raw` noch `branded`:
+   ```
+   GET /api/foods/search?q=doner+kebab&lang=en&limit=5
+   ```
+
+2. **Grammzahl IMMER über GPT-Schätzung** — NICHT aus der DB.
+   Die DB liefert Nährwerte pro 100g. Die App muss wissen wie schwer ein Döner ist.
+   → GPT schätzen lassen: "Wie schwer ist ein durchschnittlicher Döner Kebab?" (~350g)
+   → Dann: `nährwert * (350 / 100)`
 
 ---
 
@@ -315,6 +320,7 @@ final class NutritionDatabaseService {
     private let baseURL = "https://nutritionapi.uk/api"
 
     /// Sucht in eigener DB, gibt Top 5 zurück
+    /// foodType: "raw", "branded", oder "" (leer = alle, für Fertiggerichte)
     func search(
         query: String,
         foodType: String = "raw",
@@ -322,7 +328,11 @@ final class NutritionDatabaseService {
         limit: Int = 5
     ) async throws -> [NutritionSearchResult] {
         let q = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
-        let url = URL(string: "\(baseURL)/foods/search?q=\(q)&lang=\(lang)&food_type=\(foodType)&limit=\(limit)")!
+        var urlString = "\(baseURL)/foods/search?q=\(q)&lang=\(lang)&limit=\(limit)"
+        if !foodType.isEmpty {
+            urlString += "&food_type=\(foodType)"
+        }
+        let url = URL(string: urlString)!
 
         let (data, _) = try await URLSession.shared.data(from: url)
         let response = try JSONDecoder().decode(SearchResponse.self, from: data)
@@ -372,10 +382,19 @@ private func resolveIngredient(_ ingredient: ParsedIngredient) async throws -> M
     if let historyResult = await resolveFromHistory(...) { return historyResult }
 
     // 2. EIGENE DATENBANK
-    let foodType = ingredient.isBranded ? "branded" : "raw"
+    // food_type: branded → "branded", Fertiggericht → "" (alle), sonst → "raw"
+    let foodType: String
+    if ingredient.isBranded {
+        foodType = "branded"
+    } else if ingredient.isPreparedFood {  // Döner, Pizza, Big Mac etc.
+        foodType = ""  // leer = alle Typen durchsuchen
+    } else {
+        foodType = "raw"
+    }
+
     let query = ingredient.isBranded
         ? "\(ingredient.brandQuery ?? "") \(name)"
-        : englishName
+        : englishName  // NICHT "doner kebab whole", nur "doner kebab"
 
     let candidates = try? await NutritionDatabaseService.shared.search(
         query: query,
@@ -400,8 +419,8 @@ private func resolveIngredient(_ ingredient: ParsedIngredient) async throws -> M
     // 3. USDA (wie bisher) → danach in DB speichern
     if let usdaResult = try? await resolveFromUSDA(...) {
         try? await NutritionDatabaseService.shared.saveFood(
-            originalQuery: name,
-            name: usdaResult.name,
+            originalQuery: englishName,  // ✅ "doner kebab", NICHT "1 Döner"
+            name: usdaResult.name,       // ✅ korrekter Name aus USDA
             nutrients: ["energy_kcal": usdaResult.calories, "proteins": usdaResult.protein, ...],
             lang: "en"
         )
@@ -411,8 +430,8 @@ private func resolveIngredient(_ ingredient: ParsedIngredient) async throws -> M
     // 4. Web-Search (wie bisher) → danach in DB speichern
     if let webResult = await searchNutritionWithGPT(...) {
         try? await NutritionDatabaseService.shared.saveFood(
-            originalQuery: name,
-            name: webResult.name,
+            originalQuery: englishName,  // ✅ "doner kebab", NICHT "1 Döner"
+            name: webResult.name,        // ✅ korrekter Name
             brand: webResult.brand,
             nutrients: [...],
             sourceUrl: webResult.sourceUrl
@@ -430,7 +449,65 @@ private func resolveIngredient(_ ingredient: ParsedIngredient) async throws -> M
 
 ---
 
-## 7. Was ihr NICHT bauen müsst
+## 7. Parser-Query & FoodRequest — Häufige Fehler
+
+### ⚠️ Parser: Kein "whole", "raw", "fresh" an Fertiggerichte hängen
+
+Der Parser-Prompt darf bei Fertiggerichten NICHT "whole" oder "raw" an den `englishName` hängen.
+
+| User sagt | ❌ Falsch | ✅ Richtig |
+|-----------|-----------|-----------|
+| "Döner" | `"doner kebab whole"` | `"doner kebab"` |
+| "Pizza" | `"pizza whole"` | `"pizza margherita"` |
+| "Big Mac" | `"big mac whole"` | `"big mac"` |
+| "Haferflocken" | `"oats"` (okay) | `"oats"` ✅ |
+
+**Warum:** "doner kebab whole" liefert 0 Treffer in unserer DB, und bei USDA matcht "whole" auf
+"Milk, **whole**", "Bagel, **whole** wheat" usw. — komplett falsche Ergebnisse.
+
+**Regel für Parser-Prompt:** `"whole"` / `"raw"` / `"fresh"` nur bei echten Grundnahrungsmitteln
+anfügen (z.B. "banana raw", "chicken breast raw"), NICHT bei zusammengesetzten Gerichten.
+
+### ⚠️ FoodRequest: `original_query` = bereinigter Name, NICHT User-Input
+
+| Feld | ❌ Falsch | ✅ Richtig |
+|------|-----------|-----------|
+| `original_query` | `"1 Döner"` | `"doner kebab"` |
+| `original_query` | `"2 Eier"` | `"egg"` |
+| `submitted_name` | (leer) | `"Doner Kebab"` |
+
+**Warum:** Das Backend dedupliziert per `original_query`. Wenn User A "1 Döner" und User B "2 Döner"
+eingibt, werden das zwei separate Einträge statt einer Deduplizierung.
+
+**Regeln:**
+- `original_query` = der `englishName` vom Parser (ohne Menge/Einheit)
+- `submitted_name` = der korrekte, lesbare Name (englisch oder deutsch)
+- `lang` = Sprache des `submitted_name`
+
+### Beispiel: Döner korrekt
+
+```swift
+// Parser gibt: name="Döner", englishName="doner kebab", quantity=1, estimatedGrams=350
+
+// DB-Suche (ohne food_type für Fertiggerichte):
+let candidates = try await NutritionDatabaseService.shared.search(
+    query: "doner kebab",   // NICHT "doner kebab whole"
+    foodType: "",            // leer = alle Typen
+    limit: 5
+)
+
+// Falls kein Treffer → Web-Search → dann speichern:
+try await NutritionDatabaseService.shared.saveFood(
+    originalQuery: "doner kebab",     // englishName, NICHT "1 Döner"
+    name: "Doner Kebab",              // bereinigter Name
+    nutrients: ["energy_kcal": 215, "proteins": 16, "carbohydrates": 18, "fat": 9],
+    lang: "en"
+)
+```
+
+---
+
+## 8. Was ihr NICHT bauen müsst
 
 | Feature aus altem Spec | Warum nicht nötig |
 |------------------------|-------------------|
@@ -444,7 +521,7 @@ private func resolveIngredient(_ ingredient: ParsedIngredient) async throws -> M
 
 ---
 
-## 8. Kostenvergleich
+## 9. Kostenvergleich
 
 ### Vorher (pro Mahlzeit, 3 Zutaten)
 
