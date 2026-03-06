@@ -138,9 +138,9 @@ GET /api/foods/search?q=banana&lang=en&food_type=raw&limit=5
 7. Wenn "none" → weiter zu USDA/Web-Search
 ```
 
-### GPT-Auswahl: Name + Nährwert-Plausibilität (WICHTIG)
+### GPT-Auswahl: Name ZUERST, dann Kalorien-Plausibilität (WICHTIG)
 
-GPT soll NICHT einfach nur den besten Namen nehmen, sondern auch die **kcal/100g prüfen**.
+GPT prüft in **dieser Reihenfolge** — Name geht VOR Kalorien:
 
 **Prompt-Vorlage für die GPT-Auswahl:**
 
@@ -148,22 +148,37 @@ GPT soll NICHT einfach nur den besten Namen nehmen, sondern auch die **kcal/100g
 Du bekommst Kandidaten aus einer Lebensmitteldatenbank für die Suche "{originalName}".
 Wähle den besten Treffer — oder "none" wenn keiner passt.
 
-Prüfe ZWEI Dinge:
-1. NAME: Passt der Name zum gesuchten Lebensmittel?
-2. KALORIEN: Sind die kcal/100g plausibel für dieses Lebensmittel?
-   Schätze zuerst selbst, was du für realistisch hältst,
-   und wähle den Kandidaten, der am nächsten dran ist.
-   Wenn ein Kandidat beim Namen passt aber die kcal weit daneben
-   liegen (z.B. Supermarkt-Fertigprodukt statt frisches Gericht),
-   nimm einen anderen mit plausibleren Werten.
+REIHENFOLGE (wichtig!):
+1. NAME zuerst: Welche Kandidaten beschreiben dasselbe Lebensmittel?
+   Filtere alle raus, die etwas ANDERES sind.
+   Beispiel: "Oats, raw" passt zu Haferflocken,
+   aber "Cereal, frosted oats with marshmallows" ist ein ANDERES Produkt.
+   Ignoriere Kandidaten mit 0 kcal (fehlende Daten).
+
+2. KALORIEN als Tiebreaker: Wenn mehrere Kandidaten namentlich passen,
+   schätze die erwarteten kcal/100g und wähle den plausibelsten.
+
+Antworte NUR mit der Nummer (0-4) oder "none".
 
 Kandidaten:
 {candidates}
-
-Antworte NUR mit der Nummer (0-4) oder "none".
 ```
 
-**Beispiel: Döner**
+**Beispiel 1: Haferflocken**
+
+```
+Kandidaten:
+[0] Oats, raw — 379 kcal/100g (raw)
+[1] Oats, whole grain, steel cut — 0 kcal/100g (raw)
+[2] Cereal, frosted oats with marshmallows — 372 kcal/100g (raw)
+[3] Oats (USDA FDP) — 389 kcal/100g (raw)
+
+Schritt 1 (Name): #0 ✅ #1 (0 kcal → skip) #2 ❌ anderes Produkt #3 ✅
+Schritt 2 (kcal): #0 (379) und #3 (389) beide plausibel → #0 ist näher
+→ Antwort: "0"
+```
+
+**Beispiel 2: Döner**
 
 ```
 Kandidaten:
@@ -173,15 +188,12 @@ Kandidaten:
 [3] Doner kebab [Ahmed foods] — 0 kcal/100g (branded)
 [4] Döner Kebab [Super Grub] — 275 kcal/100g (branded)
 
-GPT denkt: "Ein Döner Kebab hat ca. 200-230 kcal/100g"
-→ #0 (337) ist zu hoch (Supermarkt-Fleisch pur)
-→ #1 (218) passt perfekt ✅
-→ #3 (0) hat keine Daten → skip
+Schritt 1 (Name): #0 ✅ #1 ✅ #2 ✅ #3 (0 kcal → skip) #4 ✅
+Schritt 2 (kcal): Döner ≈ 200-230 kcal/100g → #1 (218) passt am besten
 → Antwort: "1"
 ```
 
-**Wann "none":** Wenn KEIN Kandidat beim Namen passt, antwortet GPT weiterhin "none".
-Die Nährwert-Prüfung ist nur ein Tiebreaker zwischen Kandidaten die namentlich passen.
+**Wann "none":** Wenn KEIN Kandidat namentlich dasselbe Lebensmittel beschreibt.
 
 ---
 
@@ -513,6 +525,25 @@ Der Parser-Prompt darf bei Fertiggerichten NICHT "whole" oder "raw" an den `engl
 
 **Regel für Parser-Prompt:** `"whole"` / `"raw"` / `"fresh"` nur bei echten Grundnahrungsmitteln
 anfügen (z.B. "banana raw", "chicken breast raw"), NICHT bei zusammengesetzten Gerichten.
+
+### ⚠️ Parser: Deutsche Fleisch-Bezeichnungen korrekt übersetzen
+
+Der Parser muss deutsche Fleischstücke korrekt ins Englische übersetzen.
+"Hüftsteak" → "hip steak" liefert 0 Treffer sowohl in der DB als auch bei USDA.
+
+| Deutsch | ❌ Falsch | ✅ Richtig (USDA-kompatibel) |
+|---------|-----------|-------------------------------|
+| Hüftsteak | `"hip steak"` | `"sirloin steak"` |
+| Rinderfilet | `"beef fillet"` | `"beef tenderloin"` |
+| Schweinekotelett | `"pork cutlet"` | `"pork chop"` |
+| Hackfleisch | `"minced meat"` | `"ground beef"` |
+| Hähnchenschenkel | `"chicken leg"` | `"chicken thigh"` |
+| Putenbrust | `"turkey breast"` | `"turkey breast"` ✅ |
+| Rinderhüfte | `"beef hip"` | `"beef sirloin"` |
+| Entrecôte | `"entrecote"` | `"ribeye steak"` |
+
+**Tipp für Parser-Prompt:** "Übersetze Fleisch-Bezeichnungen in die USDA-üblichen englischen
+Bezeichnungen (z.B. Hüftsteak → sirloin steak, Hackfleisch → ground beef)."
 
 ### ⚠️ FoodRequest: `original_query` = bereinigter Name, NICHT User-Input
 
