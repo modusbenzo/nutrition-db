@@ -9,13 +9,16 @@ FoodRequest allows apps to submit missing food data for auto-creation.
 
 import hashlib
 import logging
+import time
 
 from django.conf import settings as django_settings
 from django.contrib.postgres.search import SearchQuery, SearchRank, TrigramSimilarity
 from django.core.cache import cache
+from django.db import connection
 from django.db.models import Case, F, FloatField, Q, Value, When
 from django.db.models.functions import Greatest
 from rest_framework import generics, status
+from rest_framework.decorators import api_view
 from rest_framework.response import Response
 
 from core.models import FoodItem, FoodNutrientValue, FoodRequest, FoodText
@@ -30,6 +33,54 @@ from .serializers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Health check
+# ---------------------------------------------------------------------------
+@api_view(["GET"])
+def health_check(request):
+    """
+    GET /api/health
+    Returns status of DB + Meilisearch. Use for uptime monitoring.
+    """
+    result = {"status": "ok", "services": {}}
+
+    # Check PostgreSQL
+    try:
+        t0 = time.monotonic()
+        with connection.cursor() as cur:
+            cur.execute("SELECT 1")
+        db_ms = round((time.monotonic() - t0) * 1000, 1)
+        result["services"]["database"] = {"status": "ok", "latency_ms": db_ms}
+    except Exception as e:
+        result["services"]["database"] = {"status": "error", "detail": str(e)}
+        result["status"] = "degraded"
+
+    # Check Meilisearch
+    try:
+        t0 = time.monotonic()
+        meili = _get_meili()
+        if meili:
+            meili.health()
+            ms_ms = round((time.monotonic() - t0) * 1000, 1)
+            result["services"]["meilisearch"] = {"status": "ok", "latency_ms": ms_ms}
+        else:
+            result["services"]["meilisearch"] = {"status": "error", "detail": "unavailable"}
+            result["status"] = "degraded"
+    except Exception as e:
+        result["services"]["meilisearch"] = {"status": "error", "detail": str(e)}
+        result["status"] = "degraded"
+
+    # Food count for quick sanity check
+    try:
+        from core.models import FoodItem
+        result["food_count"] = FoodItem.objects.count()
+    except Exception:
+        pass
+
+    http_status = 200 if result["status"] == "ok" else 503
+    return Response(result, status=http_status)
 
 
 def index_food_in_meilisearch(food_item, food_text, sources=None):
