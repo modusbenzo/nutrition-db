@@ -131,11 +131,57 @@ GET /api/foods/search?q=banana&lang=en&food_type=raw&limit=5
 ```
 1. App sucht: GET /api/foods/search?q=oats+raw&lang=en&food_type=raw&limit=5
 2. Bekommt 5 Kandidaten zurück
-3. Schickt die 5 an GPT-4o-mini: "Welcher passt am besten zu 'Haferflocken'?"
-4. GPT antwortet mit ID oder "none"
-5. Wenn ID → Nährwerte aus nutrients übernehmen
-6. Wenn "none" → weiter zu USDA/Web-Search
+3. Schickt die 5 an GPT-4o-mini mit Name + kcal/100g
+4. GPT prüft: Name-Match UND Nährwert-Plausibilität
+5. GPT antwortet mit Index oder "none"
+6. Wenn Index → Nährwerte aus nutrients übernehmen
+7. Wenn "none" → weiter zu USDA/Web-Search
 ```
+
+### GPT-Auswahl: Name + Nährwert-Plausibilität (WICHTIG)
+
+GPT soll NICHT einfach nur den besten Namen nehmen, sondern auch die **kcal/100g prüfen**.
+
+**Prompt-Vorlage für die GPT-Auswahl:**
+
+```
+Du bekommst Kandidaten aus einer Lebensmitteldatenbank für die Suche "{originalName}".
+Wähle den besten Treffer — oder "none" wenn keiner passt.
+
+Prüfe ZWEI Dinge:
+1. NAME: Passt der Name zum gesuchten Lebensmittel?
+2. KALORIEN: Sind die kcal/100g plausibel für dieses Lebensmittel?
+   Schätze zuerst selbst, was du für realistisch hältst,
+   und wähle den Kandidaten, der am nächsten dran ist.
+   Wenn ein Kandidat beim Namen passt aber die kcal weit daneben
+   liegen (z.B. Supermarkt-Fertigprodukt statt frisches Gericht),
+   nimm einen anderen mit plausibleren Werten.
+
+Kandidaten:
+{candidates}
+
+Antworte NUR mit der Nummer (0-4) oder "none".
+```
+
+**Beispiel: Döner**
+
+```
+Kandidaten:
+[0] Doner kebab [Salling] — 337 kcal/100g (branded)
+[1] Doner kebab — 218 kcal/100g (branded)
+[2] Döner Kebab [Moving Mountains] — 216 kcal/100g (branded)
+[3] Doner kebab [Ahmed foods] — 0 kcal/100g (branded)
+[4] Döner Kebab [Super Grub] — 275 kcal/100g (branded)
+
+GPT denkt: "Ein Döner Kebab hat ca. 200-230 kcal/100g"
+→ #0 (337) ist zu hoch (Supermarkt-Fleisch pur)
+→ #1 (218) passt perfekt ✅
+→ #3 (0) hat keine Daten → skip
+→ Antwort: "1"
+```
+
+**Wann "none":** Wenn KEIN Kandidat beim Namen passt, antwortet GPT weiterhin "none".
+Die Nährwert-Prüfung ist nur ein Tiebreaker zwischen Kandidaten die namentlich passen.
 
 ---
 
