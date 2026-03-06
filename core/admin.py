@@ -492,7 +492,7 @@ class FoodRequestAdmin(ModelAdmin):
     @action(description="Genehmigen & FoodItem erstellen")
     def approve_and_create(self, request, queryset):
         created = 0
-        for req in queryset.filter(status__in=["pending", "auto_created"]):
+        for req in queryset.exclude(status="rejected"):
             food_item = self._create_food_from_request(req)
             if food_item:
                 req.status = "approved"
