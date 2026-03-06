@@ -1,7 +1,7 @@
 # Nutrition Database — Anweisungen App-Team
 
 **Stand:** 06.03.2026
-**Base URL:** `http://164.92.207.35/api`
+**Base URL:** `https://nutritionapi.uk/api`
 
 ---
 
@@ -312,7 +312,7 @@ struct SearchResponse: Codable {
 final class NutritionDatabaseService {
     static let shared = NutritionDatabaseService()
 
-    private let baseURL = "http://164.92.207.35/api"
+    private let baseURL = "https://nutritionapi.uk/api"
 
     /// Sucht in eigener DB, gibt Top 5 zurück
     func search(
