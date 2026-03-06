@@ -44,12 +44,14 @@ def index_food_in_meilisearch(food_item, food_text, sources=None):
         return
 
     try:
+        name = food_text.name or ""
         doc = {
             "id": str(food_text.id),
             "food_item_id": str(food_item.id),
             "canonical_key": food_item.canonical_key,
             "food_type": food_item.food_type,
-            "name": food_text.name or "",
+            "name": name,
+            "name_length": len(name),
             "brand": food_text.brand or "",
             "lang": food_text.lang,
             "source": list(sources) if sources else ["USER_REQ"],
@@ -496,6 +498,9 @@ class FoodRequestCreateView(generics.CreateAPIView):
         if req.submitted_barcode:
             score += 0.2
 
+        if req.submitted_brand:
+            score += 0.1
+
         nutrients = req.submitted_nutrients or {}
         if nutrients.get("energy_kcal") is not None:
             score += 0.2
@@ -536,7 +541,7 @@ class FoodRequestCreateView(generics.CreateAPIView):
         try:
             food = FoodItem.objects.create(
                 canonical_key=canonical_key,
-                food_type="branded" if barcode else "raw",
+                food_type="branded" if (barcode or req.submitted_brand) else "raw",
             )
 
             FoodText.objects.create(

@@ -514,7 +514,7 @@ class FoodRequestAdmin(ModelAdmin):
         self.message_user(request, f"{updated} Anfrage(n) abgelehnt.")
 
     def _create_food_from_request(self, req):
-        """Create a FoodItem from an approved FoodRequest."""
+        """Create a FoodItem from an approved FoodRequest + index in Meilisearch."""
         name = req.submitted_name or req.original_query
         barcode = req.submitted_barcode
         canonical_key = f"req:{barcode}" if barcode else f"req:{req.id}"
@@ -525,9 +525,9 @@ class FoodRequestAdmin(ModelAdmin):
         try:
             food = FoodItem.objects.create(
                 canonical_key=canonical_key,
-                food_type="branded" if barcode else "raw",
+                food_type="branded" if (barcode or req.submitted_brand) else "raw",
             )
-            FoodText.objects.create(
+            food_text = FoodText.objects.create(
                 food_item=food,
                 lang=req.lang,
                 name=name,
@@ -575,6 +575,14 @@ class FoodRequestAdmin(ModelAdmin):
 
                 if values_to_create:
                     FoodNutrientValue.objects.bulk_create(values_to_create)
+
+            # Live-index in Meilisearch
+            from api.views import index_food_in_meilisearch
+            index_food_in_meilisearch(
+                food_item=food,
+                food_text=food_text,
+                sources=["USER_REQ"],
+            )
 
             return food
         except Exception:
